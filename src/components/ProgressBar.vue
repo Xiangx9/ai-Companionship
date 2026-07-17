@@ -1,4 +1,4 @@
-﻿<!-- 进度条组件 -->
+<!-- 进度条组件 -->
 <script setup lang="ts">
 interface Props {
   percent: number
@@ -9,7 +9,7 @@ interface Props {
 const props = withDefaults(defineProps<Props>(), {
   size: 'md',
   showLabel: true,
-  color: '#6c63ff',
+  color: '#4f8cff',
 })
 </script>
 
@@ -24,19 +24,32 @@ const props = withDefaults(defineProps<Props>(), {
 
 <style scoped>
 .progress-bar {
-  @apply flex items-center gap-2.5 w-full;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
 }
 .progress-track {
-  @apply flex-1 h-1.5 sm:h-[6px] bg-white/[0.06] rounded-md overflow-hidden;
+  flex: 1;
+  height: 6px;
+  background: rgba(255,255,255,0.06);
+  border-radius: 999px;
+  overflow: hidden;
 }
 .progress-fill {
-  @apply h-full rounded-md transition-all duration-500;
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.5s ease;
+  box-shadow: 0 0 12px rgba(79,140,255,0.25);
 }
 .progress-label {
-  @apply text-xs sm:text-sm text-[#888] min-w-[36px] text-right;
+  min-width: 36px;
+  text-align: right;
+  font-size: 12px;
+  color: var(--text-muted);
 }
-.progress-bar.sm .progress-track { @apply h-1; }
-.progress-bar.md .progress-track { @apply h-1.5; }
-.progress-bar.lg .progress-track { @apply h-2.5; }
-.progress-bar.lg .progress-label { @apply text-sm text-[#aaa]; }
+.progress-bar.sm .progress-track { height: 4px; }
+.progress-bar.md .progress-track { height: 6px; }
+.progress-bar.lg .progress-track { height: 10px; }
+.progress-bar.lg .progress-label { font-size: 13px; color: var(--text-secondary); }
 </style>

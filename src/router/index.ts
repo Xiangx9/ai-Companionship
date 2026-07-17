@@ -1,34 +1,51 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import LearningHome from '@/views/LearningHome.vue'
-import KnowledgeTreeView from '@/views/KnowledgeTreeView.vue'
-import ProjectsView from '@/views/ProjectsView.vue'
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
   routes: [
-    { path: '/', name: 'home', component: LearningHome },
-    { path: '/learn/:id', name: 'learn', component: KnowledgeTreeView },
-    { path: '/projects', name: 'projects', component: ProjectsView },
+    {
+      path: '/',
+      name: 'home',
+      component: () => import('@/views/LearningHome.vue'),
+    },
+    {
+      path: '/learn/:id',
+      name: 'learn',
+      component: () => import('@/views/KnowledgeTreeView.vue'),
+    },
+    {
+      path: '/projects',
+      name: 'projects',
+      component: () => import('@/views/ProjectsView.vue'),
+    },
+    {
+      path: '/companion',
+      name: 'companion',
+      component: () => import('@/views/CompanionView.vue'),
+    },
   ],
 })
 
 // Route guard: validate project exists before entering /learn/:id
+// Note: store is initialized in main.ts before the app mounts; this guard
+// also reads localStorage as a fallback so deep links work on hard refresh.
 router.beforeEach((to) => {
-  if (to.path.startsWith('/learn/')) {
+  if (!to.path.startsWith('/learn/')) return true
+
+  const id = String(to.params.id ?? '')
+  if (!id) return { name: 'projects' }
+
+  try {
     const saved = localStorage.getItem('aios_projects')
-    if (saved) {
-      try {
-        const projects = JSON.parse(saved)
-        const exists = projects.some((p: any) => p.id === to.params.id)
-        if (!exists) {
-          return { name: 'projects' }
-        }
-      } catch {
-        return { name: 'projects' }
-      }
-    } else {
-      return { name: 'projects' }
-    }
+    if (!saved) return { name: 'projects' }
+    const projects = JSON.parse(saved) as Array<{ id: string }>
+    const exists = projects.some((p) => p.id === id)
+    if (!exists) return { name: 'projects' }
+    // Keep active project in sync with the URL
+    localStorage.setItem('aios_active_project', id)
+    return true
+  } catch {
+    return { name: 'projects' }
   }
 })
 

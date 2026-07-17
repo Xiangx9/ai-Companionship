@@ -1,7 +1,8 @@
-﻿<!-- AI 教学对话框组件 -->
+<!-- AI 教学对话框组件 -->
 <script setup lang="ts">
-import { ref, watch, nextTick } from 'vue'
+import { ref, watch, nextTick, computed } from 'vue'
 import type { TeachingMessage } from '@/types/learning'
+import { renderMessageContent } from '@/utils/markdown'
 
 interface Props {
   messages: TeachingMessage[]
@@ -14,9 +15,19 @@ const emit = defineEmits<{ send: [answer: string] }>()
 const input = ref('')
 const chatRef = ref<HTMLElement>()
 
-watch(() => props.messages.length, () => {
-  nextTick(() => scrollToBottom())
-})
+const renderedMessages = computed(() =>
+  props.messages.map((msg) => ({
+    ...msg,
+    html: renderMessageContent(msg.content),
+  })),
+)
+
+watch(
+  () => props.messages.length,
+  () => {
+    nextTick(() => scrollToBottom())
+  },
+)
 
 function scrollToBottom() {
   if (chatRef.value) {
@@ -31,30 +42,37 @@ function sendMessage() {
 }
 
 function getTypeIcon(type: string) {
-  const icons: Record<string, string> = { text: '💬', code: '💻', diagram: '📊', question: '🤔', feedback: '📈' }
+  const icons: Record<string, string> = {
+    text: '💬',
+    code: '💻',
+    diagram: '📊',
+    question: '🤔',
+    feedback: '📈',
+  }
   return icons[type] ?? '💬'
-}
-
-function formatContent(content: string): string {
-  return content.replace(/\n/g, '<br/>');
 }
 </script>
 
 <template>
   <div class="ai-chat">
     <div class="chat-header">
-      <span class="teacher-avatar">🧑‍🏫</span>
-      <div>
+      <div class="teacher-avatar">🧑‍🏫</div>
+      <div class="header-copy">
         <div class="teacher-name">Learning Mentor</div>
         <div class="teacher-topic">{{ kpTitle }}</div>
       </div>
+      <span class="live-pill">教学中</span>
     </div>
 
     <div ref="chatRef" class="chat-messages">
-      <div v-for="msg in props.messages" :key="msg.id" class="message" :class="msg.role">
+      <div v-if="renderedMessages.length === 0" class="empty-chat">
+        <div class="empty-icon">🧑‍🏫</div>
+        <p>点击下方「开始 AI 教学」开启本知识点的私教会话</p>
+      </div>
+      <div v-for="msg in renderedMessages" :key="msg.id" class="message" :class="msg.role">
         <div class="message-icon">{{ getTypeIcon(msg.type) }}</div>
         <div class="message-body">
-          <div class="message-content" v-html="formatContent(msg.content)"></div>
+          <div class="message-content" v-html="msg.html"></div>
           <div class="message-time">{{ new Date(msg.timestamp).toLocaleTimeString('zh-CN') }}</div>
         </div>
       </div>
@@ -68,65 +86,187 @@ function formatContent(content: string): string {
         :disabled="disabled"
         @keydown.enter="sendMessage"
       />
-      <button class="chat-send-btn" @click="sendMessage" :disabled="disabled || !input.trim()">发送</button>
+      <button class="btn btn-primary send-btn" type="button" :disabled="disabled || !input.trim()" @click="sendMessage">发送</button>
     </div>
   </div>
 </template>
 
 <style scoped>
 .ai-chat {
-  @apply flex flex-col h-full bg-[#0f0f2a] rounded-xl border border-white/[0.06];
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background:
+    linear-gradient(180deg, rgba(79,140,255,0.05), transparent 18%),
+    rgba(12, 18, 32, 0.92);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  overflow: hidden;
+  box-shadow: var(--shadow-sm);
 }
+
 .chat-header {
-  @apply flex items-center gap-3 p-3 sm:p-4 border-b border-white/[0.06];
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(8, 12, 22, 0.28);
 }
+
 .teacher-avatar {
-  @apply text-[28px] sm:text-[32px];
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  background:
+    linear-gradient(145deg, rgba(79,140,255,0.18), rgba(34,195,166,0.1));
+  border: 1px solid rgba(79,140,255,0.22);
+  font-size: 20px;
 }
+
+.header-copy {
+  min-width: 0;
+  flex: 1;
+}
+
 .teacher-name {
-  @apply text-xs sm:text-sm font-semibold text-white;
+  font-size: 14px;
+  font-weight: 700;
+  color: #f2f6ff;
 }
+
 .teacher-topic {
-  @apply text-[11px] sm:text-xs text-[#6c63ff];
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
+
+.live-pill {
+  flex-shrink: 0;
+  border-radius: 999px;
+  padding: 5px 10px;
+  font-size: 11px;
+  color: #b8fff0;
+  background: rgba(34,195,166,0.12);
+  border: 1px solid rgba(34,195,166,0.24);
+}
+
 .chat-messages {
-  @apply flex-1 overflow-y-auto p-2.5 sm:p-4 flex flex-col gap-3;
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
+
+.empty-chat {
+  margin: auto;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 13px;
+  max-width: 28ch;
+  line-height: 1.6;
+}
+
+.empty-icon {
+  width: 48px;
+  height: 48px;
+  margin: 0 auto 10px;
+  border-radius: 14px;
+  display: grid;
+  place-items: center;
+  background: rgba(79,140,255,0.1);
+  border: 1px solid rgba(79,140,255,0.18);
+  font-size: 22px;
+}
+
 .message {
-  @apply flex gap-2.5 max-w-[85%] sm:max-w-[85%];
+  display: flex;
+  gap: 10px;
+  max-width: 92%;
 }
-.message.teacher {
-  @apply self-start;
-}
+
 .message.student {
-  @apply self-end flex-row-reverse;
+  margin-left: auto;
+  flex-direction: row-reverse;
 }
+
 .message-icon {
-  @apply text-base sm:text-lg flex-shrink-0 mt-0.5;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--border);
+  flex-shrink: 0;
 }
+
 .message-body {
-  @apply flex flex-col gap-1;
+  min-width: 0;
 }
+
 .message-content {
-  @apply text-xs sm:text-sm leading-relaxed text-[#ddd] whitespace-pre-wrap break-words;
+  padding: 10px 12px;
+  border-radius: 12px;
+  font-size: 13px;
+  line-height: 1.65;
+  word-break: break-word;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--border);
+  color: var(--text);
 }
+
+.message.student .message-content {
+  background: linear-gradient(135deg, rgba(79,140,255,0.92), rgba(61,116,223,0.96));
+  border-color: transparent;
+  color: #fff;
+  box-shadow: 0 8px 18px rgba(61,116,223,0.18);
+}
+
 .message-time {
-  @apply text-[10px] text-[#555];
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--text-muted);
 }
+
+.message.student .message-time {
+  text-align: right;
+}
+
 .chat-input-area {
-  @apply flex gap-2 p-2.5 sm:p-3 border-t border-white/[0.06];
+  display: flex;
+  gap: 8px;
+  padding: 12px;
+  border-top: 1px solid var(--border);
+  background: rgba(7, 11, 20, 0.45);
 }
+
 .chat-input {
-  @apply flex-1 px-3.5 py-2.5 sm:py-3 border border-[#2a2a4a] rounded-lg bg-[#1a1a2e] text-[#e0e0e0] text-sm sm:text-base outline-none;
+  flex: 1;
+  border-radius: 10px;
+  border: 1px solid var(--border-strong);
+  background: rgba(255,255,255,0.03);
+  color: var(--text);
+  padding: 10px 12px;
+  outline: none;
+  transition: 0.18s ease;
 }
+
 .chat-input:focus {
-  @apply border-[#6c63ff];
+  border-color: rgba(79,140,255,0.45);
+  box-shadow: 0 0 0 3px rgba(79,140,255,0.12);
 }
-.chat-input:disabled {
-  @apply opacity-50;
-}
-.chat-send-btn {
-  @apply px-4 sm:px-5 py-2.5 sm:py-3 border-0 rounded-lg bg-[#6c63ff] text-white text-sm sm:text-base cursor-pointer transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed hover:bg-[#5a52d4];
+
+.send-btn {
+  min-height: 42px;
+  padding-left: 16px;
+  padding-right: 16px;
 }
 </style>
-

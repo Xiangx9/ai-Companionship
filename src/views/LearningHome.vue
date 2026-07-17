@@ -1,8 +1,10 @@
-﻿<!-- AI Learning OS - 首页 -->
+<!-- AI Learning OS - 首页 -->
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { useLearningStore } from '@/store/learning'
+import { toastError, toastWarning } from '@/utils/toast'
+import type { LearningProject } from '@/types/learning'
 
 const router = useRouter()
 const store = useLearningStore()
@@ -13,20 +15,39 @@ const loading = ref(false)
 const error = ref('')
 
 const levelOptions = [
-  { value: 'beginner' as const, label: '零基础', icon: '🌱' },
-  { value: 'intermediate' as const, label: '有经验', icon: '🌿' },
-  { value: 'advanced' as const, label: '进阶', icon: '🌳' },
+  { value: 'beginner' as const, label: '零基础', icon: '🌱', hint: '从基础概念开始' },
+  { value: 'intermediate' as const, label: '有经验', icon: '🌿', hint: '跳过入门铺垫' },
+  { value: 'advanced' as const, label: '进阶', icon: '🌳', hint: '偏深度与体系' },
+]
+
+const fields = ['编程', 'AI', '数学', '英语', '摄影', '投资', '心理学', '历史', '法律', '考研']
+
+const features = [
+  { icon: '🗺️', title: '知识图谱', desc: '结构化路径，一眼看清学什么' },
+  { icon: '🤖', title: 'AI 老师', desc: '讲解、提问、评分一体' },
+  { icon: '📈', title: '学习报告', desc: '进度、薄弱点自动整理' },
+  { icon: '🌙', title: '情感陪伴', desc: '学累了也能先缓一缓' },
 ]
 
 async function startLearning() {
-  if (!input.value.trim()) { error.value = '请输入你想学习的内容'; return }
+  if (!input.value.trim()) {
+    error.value = '请输入你想学习的内容'
+    return
+  }
   loading.value = true
   error.value = ''
   try {
     const project = await store.createProject(input.value.trim(), level.value)
     if (project) router.push('/learn/' + project.id)
   } catch (err) {
-    error.value = err instanceof Error ? err.message : '生成失败，请重试'
+    if (store.isGenerationAborted(err)) {
+      error.value = ''
+      toastWarning('已取消生成')
+      return
+    }
+    const msg = err instanceof Error ? err.message : '生成失败，请重试'
+    error.value = msg
+    toastError(msg)
   } finally {
     loading.value = false
   }
@@ -36,283 +57,643 @@ function selectLevel(l: string) {
   level.value = l as 'beginner' | 'intermediate' | 'advanced'
 }
 
+function useField(field: string) {
+  input.value = '我想学习' + field
+}
 
-// 最近项目
 const recentProjects = computed(() => {
   return [...store.projects]
-    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+    .sort((a, b) => new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime())
     .slice(0, 3)
 })
+
+const continueEntry = computed(() => store.getLatestContinueProject())
+
+function continueLearning() {
+  const entry = continueEntry.value
+  if (!entry) return
+  store.setActiveProject(entry.project.id)
+  router.push({
+    path: '/learn/' + entry.project.id,
+    query: { kp: entry.target.kpId, resume: '1' },
+  })
+}
+
+function cancelCreate() {
+  store.cancelGeneration()
+  loading.value = false
+  error.value = ''
+}
+
+function formatDate(value?: string) {
+  if (!value) return ''
+  try {
+    return new Date(value).toLocaleDateString('zh-CN')
+  } catch {
+    return value
+  }
+}
+
+function progressPercent(proj: LearningProject) {
+  const total = (proj.path?.modules ?? []).reduce((sum, mod) => sum + (mod.knowledgePoints?.length ?? 0), 0)
+  if (!total) return 0
+  const done = (proj.progress ?? []).filter((p) => p.status === 'completed' || p.status === 'mastered').length
+  return Math.round((done / total) * 100)
+}
 </script>
 
 <template>
   <div class="home">
-    <!-- 背景装饰 -->
-    <div class="bg-decoration">
-      <div class="orb orb-1"></div>
-      <div class="orb orb-2"></div>
-      <div class="orb orb-3"></div>
-    </div>
+    <div class="home-grid">
+      <section class="hero surface">
+        <div class="hero-glow" aria-hidden="true"></div>
+        <div class="hero-kicker">纯前端 · 本地持久化 · 可导入导出</div>
+        <h1 class="hero-title">AI Learning OS</h1>
+        <p class="hero-desc">输入任何想学的内容，AI 自动规划路径、讲解知识点，并帮你持续推进。</p>
 
-    <div class="container">
-      <!-- Logo -->
-      <div class="logo-section">
-        <span class="logo-icon">🎓</span>
-        <h1 class="logo-text">AI Learning OS</h1>
-      </div>
-
-      <!-- 一句话介绍 -->
-      <p class="tagline">输入任何想学的内容，AI 自动成为你的私人老师</p>
-
-      <!-- 输入框 -->
-      <div class="input-section">
-        <div class="input-wrapper">
-          <span class="input-icon">💬</span>
-          <input
-            v-model="input"
-            class="main-input"
-            type="text"
-            placeholder="我想学习前端开发..."
-            @keydown.enter="startLearning"
-          />
-          <button class="submit-btn" @click="startLearning" :disabled="loading || !input.trim()">
-            <span v-if="loading" class="spinner"></span>
-            {{ loading ? 'AI 分析中...' : '开始学习' }}
-          </button>
+        <div v-if="continueEntry" class="continue-banner">
+          <div class="continue-main">
+            <div class="continue-kicker">继续上次学习</div>
+            <div class="continue-title">{{ continueEntry.project.name }}</div>
+            <div class="continue-sub">下一步：{{ continueEntry.target.kpTitle }}</div>
+          </div>
+          <button class="btn btn-secondary" type="button" @click="continueLearning">继续学习</button>
         </div>
 
-        <!-- 水平选择 -->
-        <div class="level-selector">
-          <span class="level-label">当前水平：</span>
-          <button
-            v-for="opt in levelOptions"
-            :key="opt.value"
-            class="level-btn"
-            :class="{ active: level === opt.value }"
-            @click="selectLevel(opt.value)"
-          >
-            {{ opt.icon }} {{ opt.label }}
-          </button>
-        </div>
-
-        <!-- 错误提示 -->
-        <p v-if="error" class="error-text">{{ error }}</p>
-      </div>
-
-      <!-- 支持领域 -->
-      <div class="supported-fields">
-        <span class="fields-label">支持领域：</span>
-        <span class="field-tag">编程</span>
-        <span class="field-tag">AI</span>
-        <span class="field-tag">数学</span>
-        <span class="field-tag">英语</span>
-        <span class="field-tag">摄影</span>
-        <span class="field-tag">投资</span>
-        <span class="field-tag">心理学</span>
-        <span class="field-tag">历史</span>
-        <span class="field-tag">法律</span>
-        <span class="field-tag">考研</span>
-      </div>
-
-      <!-- 功能亮点 -->
-      <div class="features">
-        <div class="feature">
-          <span class="feature-icon">🗺️</span>
-          <span>智能知识图谱</span>
-        </div>
-        <div class="feature">
-          <span class="feature-icon">🤖</span>
-          <span>AI 私人老师</span>
-        </div>
-        <div class="feature">
-          <span class="feature-icon">📈</span>
-          <span>自动学习报告</span>
-        </div>
-        <div class="feature">
-          <span class="feature-icon">📚</span>
-          <span>多维学习资源</span>
-        </div>
-      </div>
-
-      <!-- 最近项目 -->
-      <div v-if="recentProjects.length > 0" class="recent-projects">
-        <div class="rp-header">
-          <span class="rp-title">最近项目</span>
-          <span class="rp-more" @click="router.push(`/learn/${recentProjects[0].id}`)">继续学习 →</span>
-        </div>
-        <div class="rp-list">
-          <div v-for="proj in recentProjects" :key="proj.id" class="rp-card" @click="router.push(`/learn/${proj.id}`)">
-            <div class="rp-info">
-              <span class="rp-name">{{ proj.name }}</span>
-              <span class="rp-date">{{ proj.updatedAt }}</span>
+        <div class="composer">
+          <div class="composer-row">
+            <span class="composer-icon">✦</span>
+            <input
+              v-model="input"
+              class="composer-input"
+              type="text"
+              placeholder="例如：系统学习前端开发 / 考研数学 / 摄影构图"
+              @keydown.enter="startLearning"
+            />
+            <div class="composer-actions">
+              <button class="btn btn-primary" type="button" :disabled="loading || !input.trim()" @click="startLearning">
+                <span v-if="loading" class="spinner"></span>
+                {{ loading ? (store.generateProgress || '生成中...') : '开始学习' }}
+              </button>
+              <button
+                v-if="loading"
+                class="btn btn-ghost cancel-btn"
+                type="button"
+                @click="cancelCreate"
+              >
+                取消
+              </button>
             </div>
-            <div class="rp-action">继续 →</div>
+          </div>
+
+          <div class="level-row">
+            <span class="level-label">当前水平</span>
+            <div class="level-options">
+              <button
+                v-for="opt in levelOptions"
+                :key="opt.value"
+                type="button"
+                class="level-card"
+                :class="{ active: level === opt.value }"
+                @click="selectLevel(opt.value)"
+              >
+                <span class="level-icon">{{ opt.icon }}</span>
+                <span class="level-text">
+                  <strong>{{ opt.label }}</strong>
+                  <small>{{ opt.hint }}</small>
+                </span>
+              </button>
+            </div>
+          </div>
+
+          <p v-if="error" class="error-text">{{ error }}</p>
+        </div>
+
+        <div class="field-row">
+          <span class="section-title">快速选择</span>
+          <div class="field-list">
+            <button v-for="field in fields" :key="field" type="button" class="field-tag" @click="useField(field)">
+              {{ field }}
+            </button>
           </div>
         </div>
-      </div>
+      </section>
+
+      <aside class="side-stack">
+        <button class="companion-card surface" type="button" @click="router.push('/companion')">
+          <div class="companion-top">
+            <span class="companion-badge">🌙 星语</span>
+            <span class="companion-go">去聊聊 →</span>
+          </div>
+          <h2>学累了，先休息一下</h2>
+          <p>不赶进度，不说教。适合焦虑、疲惫或只想找人聊聊的时候。</p>
+          <div class="companion-pills">
+            <span>温柔倾听</span>
+            <span>本地会话</span>
+            <span>随时退出</span>
+          </div>
+        </button>
+
+        <section class="feature-panel surface">
+          <div class="section-title">能力概览</div>
+          <div class="feature-list">
+            <div v-for="item in features" :key="item.title" class="feature-item">
+              <div class="feature-icon">{{ item.icon }}</div>
+              <div>
+                <div class="feature-title">{{ item.title }}</div>
+                <div class="feature-desc">{{ item.desc }}</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section v-if="recentProjects.length" class="recent-panel surface">
+          <div class="recent-head">
+            <div class="section-title">最近项目</div>
+            <button class="btn btn-ghost" type="button" @click="router.push('/projects')">全部</button>
+          </div>
+          <div class="recent-list">
+            <button
+              v-for="proj in recentProjects"
+              :key="proj.id"
+              type="button"
+              class="recent-item"
+              @click="router.push('/learn/' + proj.id)"
+            >
+              <div class="recent-main">
+                <div class="recent-name">{{ proj.name }}</div>
+                <div class="recent-meta">{{ formatDate(proj.updatedAt || proj.createdAt) }} · {{ proj.path?.modules?.length || 0 }} 模块</div>
+                <div class="progress-mini recent-progress" aria-hidden="true">
+                  <span :style="{ width: progressPercent(proj) + '%' }"></span>
+                </div>
+              </div>
+              <div class="recent-right">
+                <strong>{{ progressPercent(proj) }}%</strong>
+                <span class="recent-arrow">→</span>
+              </div>
+            </button>
+          </div>
+        </section>
+      </aside>
     </div>
   </div>
 </template>
 
 <style scoped>
 .home {
-  @apply min-h-screen flex items-center justify-center bg-[#0a0a1a] relative overflow-hidden px-5 sm:px-8 md:px-20;
+  padding: 28px 20px 40px;
 }
-.bg-decoration {
-  @apply absolute inset-0 pointer-events-none;
+
+.home-grid {
+  max-width: 1120px;
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(280px, 0.85fr);
+  gap: 18px;
+  align-items: start;
 }
-.orb {
-  @apply absolute rounded-full;
-  filter: blur(80px);
-  opacity: 0.15;
+
+.hero,
+.companion-card,
+.feature-panel,
+.recent-panel {
+  padding: 22px;
 }
-.orb-1 {
-  @apply w-[400px] h-[400px] bg-[#6c63ff] -top-[100px] -left-[100px];
-  animation: float 8s ease-in-out infinite;
+
+.hero {
+  overflow: hidden;
 }
-.orb-2 {
-  @apply w-[300px] h-[300px] bg-[#00b894] -bottom-[50px] -right-[50px];
-  animation: float 10s ease-in-out infinite reverse;
+
+.hero-glow {
+  position: absolute;
+  inset: auto auto -40px -40px;
+  width: 220px;
+  height: 220px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(79,140,255,0.16), transparent 70%);
+  pointer-events: none;
 }
-.orb-3 {
-  @apply w-[200px] h-[200px] bg-[#fd79a8] top-1/2 left-[60%];
-  animation: float 12s ease-in-out infinite;
+
+.hero-kicker {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(79,140,255,0.25);
+  background: rgba(79,140,255,0.1);
+  color: #c7dbff;
+  font-size: 12px;
+  margin-bottom: 14px;
 }
-@keyframes float {
-  0%, 100% { transform: translate(0, 0); }
-  50% { transform: translate(30px, -30px); }
+
+.hero-title {
+  margin: 0 0 10px;
+  font-size: 36px;
+  line-height: 1.12;
+  letter-spacing: -0.03em;
+  color: #f4f7ff;
 }
-.container {
-  @apply relative z-10 max-w-[640px] text-center;
+
+.hero-desc {
+  margin: 0 0 22px;
+  color: var(--text-secondary);
+  font-size: 15px;
+  line-height: 1.7;
+  max-width: 52ch;
 }
-.logo-section {
-  @apply mb-6;
+
+.continue-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding: 14px 16px;
+  border-radius: 14px;
+  border: 1px solid rgba(34, 195, 166, 0.28);
+  background:
+    linear-gradient(135deg, rgba(34, 195, 166, 0.14), transparent 55%),
+    rgba(10, 18, 28, 0.7);
 }
-.logo-icon {
-  @apply text-[48px] block mb-2;
+
+.continue-kicker {
+  font-size: 11px;
+  color: #8ef0da;
+  margin-bottom: 4px;
 }
-.logo-text {
-  @apply text-[36px] font-extrabold leading-tight m-0;
-  background: linear-gradient(135deg, #6c63ff, #00b894);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
+
+.continue-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #f2f8ff;
 }
-.tagline {
-  @apply text-base sm:text-lg text-[#888] mb-12 leading-relaxed;
+
+.continue-sub {
+  margin-top: 3px;
+  font-size: 12px;
+  color: var(--text-muted);
 }
-.input-section {
-  @apply mb-10;
+
+.composer {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-bottom: 22px;
 }
-.input-wrapper {
-  @apply flex items-center gap-3 p-2 bg-white/[0.03] border border-white/[0.08] rounded-xl transition-all duration-300 focus-within:border-[#6c63ff] focus-within:shadow-[0_0_0_3px_rgba(108,99,255,0.15)];
+
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
 }
-.input-icon {
-  @apply text-xl px-2;
+
+.cancel-btn {
+  white-space: nowrap;
 }
-.main-input {
-  @apply flex-1 py-3 border-0 bg-transparent text-[#e0e0e0] text-base outline-none;
+
+.composer-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border-radius: 16px;
+  border: 1px solid var(--border-strong);
+  background: rgba(7, 11, 20, 0.55);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
 }
-.main-input::placeholder { @apply text-[#555]; }
-.submit-btn {
-  @apply px-7 py-3 border-0 rounded-xl bg-gradient-to-br from-[#6c63ff] to-[#4834d4] text-white text-sm font-semibold cursor-pointer transition-all duration-200 whitespace-nowrap flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed hover:translate-y-[-1px] hover:shadow-[0_4px_20px_rgba(108,99,255,0.4)];
+
+.composer-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  color: #9ec0ff;
+  background: rgba(79,140,255,0.12);
+  flex-shrink: 0;
 }
+
+.composer-input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 15px;
+  padding: 8px 0;
+}
+
+.composer-input::placeholder {
+  color: #66758f;
+}
+
+.level-row,
+.field-row {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.level-label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.level-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.level-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-align: left;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: rgba(255,255,255,0.025);
+  color: var(--text-secondary);
+  padding: 10px 12px;
+  cursor: pointer;
+  transition: 0.18s ease;
+}
+
+.level-card:hover {
+  border-color: rgba(79,140,255,0.28);
+  background: rgba(79,140,255,0.06);
+}
+
+.level-card.active {
+  color: #e8f1ff;
+  border-color: rgba(79,140,255,0.42);
+  background: rgba(79,140,255,0.12);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+}
+
+.level-icon {
+  font-size: 16px;
+}
+
+.level-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.level-text strong {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.level-text small {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.field-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.field-tag {
+  border: 1px solid var(--border);
+  background: rgba(255,255,255,0.03);
+  color: var(--text-secondary);
+  border-radius: 999px;
+  padding: 7px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: 0.18s ease;
+}
+
+.field-tag:hover {
+  color: var(--text);
+  border-color: rgba(79,140,255,0.35);
+  background: rgba(79,140,255,0.08);
+}
+
+.error-text {
+  margin: 0;
+  color: #ff8b97;
+  font-size: 12px;
+}
+
+.side-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.companion-card {
+  text-align: left;
+  cursor: pointer;
+  transition: 0.18s ease;
+  background:
+    linear-gradient(160deg, rgba(79,140,255,0.14), transparent 42%),
+    linear-gradient(180deg, rgba(17,26,44,0.96), rgba(12,18,32,0.96));
+  overflow: hidden;
+}
+
+.companion-card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(79,140,255,0.35);
+}
+
+.companion-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.companion-badge,
+.companion-go {
+  font-size: 12px;
+  color: #c9d8f5;
+}
+
+.companion-card h2 {
+  margin: 0 0 8px;
+  font-size: 18px;
+  color: #f3f7ff;
+}
+
+.companion-card p {
+  margin: 0 0 14px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.companion-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.companion-pills span {
+  border-radius: 999px;
+  border: 1px solid rgba(79,140,255,0.18);
+  background: rgba(79,140,255,0.08);
+  color: #cfe0ff;
+  font-size: 11px;
+  padding: 4px 8px;
+}
+
+.feature-list,
+.recent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.feature-item,
+.recent-item {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: rgba(255,255,255,0.025);
+}
+
+.feature-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  background: rgba(79,140,255,0.1);
+  flex-shrink: 0;
+}
+
+.feature-title,
+.recent-name {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.feature-desc,
+.recent-meta {
+  margin-top: 3px;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.recent-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.recent-item {
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  align-items: center;
+  justify-content: space-between;
+  transition: 0.18s ease;
+  color: inherit;
+}
+
+.recent-item:hover {
+  border-color: rgba(79,140,255,0.3);
+  background: rgba(79,140,255,0.08);
+}
+
+.recent-main {
+  min-width: 0;
+  flex: 1;
+}
+
+.recent-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.recent-progress {
+  margin-top: 8px;
+  max-width: 180px;
+}
+
+.recent-right {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  flex-shrink: 0;
+  margin-left: 10px;
+}
+
+.recent-right strong {
+  font-size: 12px;
+  color: #cfe0ff;
+}
+
+.recent-arrow {
+  color: #8eb4ff;
+}
+
 .spinner {
-  @apply w-4 h-4 border-2 border-white/[0.3] border-t-white rounded-full;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255,255,255,0.3);
+  border-top-color: #fff;
+  border-radius: 50%;
   animation: spin 0.8s linear infinite;
 }
-@keyframes spin { to { transform: rotate(360deg); } }
-.level-selector {
-  @apply flex items-center justify-center gap-2 mt-4;
-}
-.level-label {
-  @apply text-xs text-[#666];
-}
-.level-btn {
-  @apply px-3.5 py-1.5 border border-white/[0.1] rounded-[20px] bg-transparent text-[#aaa] text-xs cursor-pointer transition-all duration-200 hover:border-[rgba(108,99,255,0.3)] hover:text-white;
-}
-.level-btn.active {
-  @apply bg-[rgba(108,99,255,0.15)] border-[#6c63ff] text-white;
-}
-.error-text {
-  @apply mt-3 text-xs text-[#ff4757];
-}
-.supported-fields {
-  @apply mb-8;
-}
-.fields-label {
-  @apply text-xs text-[#555];
-}
-.field-tag {
-  @apply inline-block px-3 py-1 mx-1 my-1 border border-white/[0.06] rounded-[16px] text-xs text-[#888] bg-white/[0.02];
-}
-.features {
-  @apply grid grid-cols-4 gap-3;
-}
-.feature {
-  @apply flex items-center gap-2 p-3 bg-[rgba(108,99,255,0.05)] border border-[rgba(108,99,255,0.1)] rounded-lg text-xs text-[#bbb];
-}
-.feature-icon {
-  @apply text-lg;
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
-.recent-projects {
-  @apply mt-8;
-}
-.rp-header {
-  @apply flex justify-between items-center mb-3;
-}
-.rp-title {
-  @apply text-sm font-semibold text-[#aaa];
-}
-.rp-more {
-  @apply text-xs text-[#6c63ff] cursor-pointer hover:text-[#8b8bff];
-}
-.rp-list {
-  @apply flex flex-col gap-2;
-}
-.rp-card {
-  @apply flex items-center justify-between p-3.5 bg-white/[0.02] border border-white/[0.06] rounded-lg cursor-pointer transition-all duration-200 hover:border-[rgba(108,99,255,0.2)] hover:bg-[rgba(108,99,255,0.03)];
-}
-.rp-info {
-  @apply flex flex-col gap-1;
-}
-.rp-name {
-  @apply text-sm text-white font-medium truncate max-w-[200px];
-}
-.rp-date {
-  @apply text-xs text-[#666];
-}
-.rp-action {
-  @apply text-xs text-[#6c63ff] flex-shrink-0;
+@media (max-width: 960px) {
+  .home-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
-/* Responsive: tablet */
-@media (max-width: 1024px) {
-  .container { @apply max-w-[560px]; }
-  .features { @apply grid-cols-2; }
+@media (max-width: 720px) {
+  .level-options {
+    grid-template-columns: 1fr;
+  }
 }
 
-/* Responsive: mobile */
 @media (max-width: 640px) {
-  .home { @apply px-4; }
-  .logo-icon { @apply text-[40px]; }
-  .logo-text { @apply text-[26px]; }
-  .tagline { @apply text-sm mb-8; }
-  .input-wrapper { @apply flex-col rounded-lg p-3; }
-  .main-input { @apply w-full text-center; }
-  .submit-btn { @apply w-full justify-center py-3.5; }
-  .level-selector { @apply flex-wrap gap-1.5; }
-  .supported-fields { @apply pl-4 pr-0 -mx-4 overflow-x-auto whitespace-nowrap; }
-  .features { @apply grid-cols-1 px-4; }
-  .feature { @apply p-2.5; }
+  .home {
+    padding: 16px 12px 28px;
+  }
+  .hero,
+  .companion-card,
+  .feature-panel,
+  .recent-panel {
+    padding: 16px;
+  }
+  .hero-title {
+    font-size: 28px;
+  }
+  .composer-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .composer-input {
+    width: 100%;
+  }
+  .btn-primary {
+    width: 100%;
+  }
 }
 </style>
-
-
-
-
-
-
-
-

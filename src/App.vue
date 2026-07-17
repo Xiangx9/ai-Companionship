@@ -1,23 +1,56 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
+import { computed } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import ToastHost from '@/components/ToastHost.vue'
+
+const route = useRoute()
+const router = useRouter()
+
+const links = [
+  { name: 'home', label: '首页', path: '/' },
+  { name: 'projects', label: '项目', path: '/projects' },
+  { name: 'companion', label: '陪伴', path: '/companion' },
+]
+
+const activeName = computed(() => {
+  if (route.name === 'learn') return 'projects'
+  return String(route.name || 'home')
+})
+
+function go(path: string) {
+  if (route.path !== path) router.push(path)
+}
 </script>
 
 <template>
-  <RouterView />
+  <div class="app-shell">
+    <header class="app-nav">
+      <a class="brand" href="/" @click.prevent="go('/')">
+        <span class="brand-mark">🎓</span>
+        <span>
+          <div class="brand-text">AI Learning OS</div>
+          <div class="brand-sub">本地学习工作台</div>
+        </span>
+      </a>
+
+      <nav class="nav-links" aria-label="主导航">
+        <button
+          v-for="link in links"
+          :key="link.name"
+          type="button"
+          class="nav-link"
+          :class="{ active: activeName === link.name }"
+          @click="go(link.path)"
+        >
+          {{ link.label }}
+        </button>
+      </nav>
+    </header>
+
+    <main class="page">
+      <RouterView />
+    </main>
+
+    <ToastHost />
+  </div>
 </template>
-
-<style>
-
-/* Custom base overrides */
-html, body {
-  height: 100%;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
-  background: #0a0a1a;
-  color: #e0e0e0;
-}
-#app { height: 100%; }
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #3a3a5a; border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: #5a5a7a; }
-</style>
-
