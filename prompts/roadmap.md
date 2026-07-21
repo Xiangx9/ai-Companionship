@@ -21,6 +21,10 @@ knowledgeTree 可省略（客户端可重建）。
 6. level 取 beginner|intermediate|advanced
 7. 总时长 20-60 小时
 
+## 速度与体积
+- 字段尽量短；不要示例外的额外字段
+- 尽快完成输出，避免冗长叙述
+
 ## 内容要求
 - 循序渐进，prerequisites 标注依赖 id
 - 零基础从基础概念开始

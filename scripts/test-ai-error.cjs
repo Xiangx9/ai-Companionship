@@ -53,6 +53,14 @@ check('http', Object.assign(new Error('AI 请求失败 (500): boom'), { code: 'h
   code: 'http',
   retryable: true,
 })
+check('cloudflare 524', Object.assign(new Error('AI 请求失败 (524): error code: 524'), { code: 'http' }), {
+  code: 'timeout',
+  retryable: true,
+})
+check('gateway 504 text', new Error('AI 请求失败 (504): Gateway Time-out'), {
+  code: 'timeout',
+  retryable: true,
+})
 check('network text', new Error('Failed to fetch'), {
   code: 'network',
   retryable: true,

@@ -22,6 +22,8 @@ import {
 import { normalizeMarkdown } from '@/utils/markdown'
 import { getAiConfig, DEFAULT_AI_MODEL } from '@/services/aiConfig'
 import { aiFetch } from '@/services/aiFetch'
+import type { PlanKpRef } from '@/utils/studyPlanRoll'
+import { summarizeKpsForPrompt } from '@/utils/studyPlanRoll'
 
 interface ChatMessage {
   role: 'system' | 'user' | 'assistant'
@@ -313,7 +315,7 @@ export async function chatCompletion(
     // 1.5 more reliably returns direct JSON; 2.0 often spends tokens on reasoning
     model = getDefaultModel(),
     temperature = 0.7,
-    maxTokens = 8192,
+    maxTokens = 4096,
     signal,
     timeoutMs = 180000,
     onDelta,
@@ -640,35 +642,38 @@ export async function generateLearningPath(
 ): Promise<LearningPath> {
   const systemPromptBase = await loadPrompt('roadmap',
     '你是 AI Learning OS 的学习路径规划引擎。\n' +
-    '规则：输出严格 JSON，不要 markdown 代码块。\n' +
-    '4-8 个模块，每模块 3-6 个知识点。\n' +
-    '每个知识点至少 2 个资源（视频+文档+练习）。\n' +
-    '视频优先 Bilibili，文档优先 MDN/官方文档。\n' +
-    '标注 prerequisites 依赖关系。\n' +
-    'knowledgeTree 是模块的嵌套树形结构。\n' +
-    '时长合理预估，总时长 20-120 小时。'
+    '规则：只输出严格 JSON，不要 markdown。\n' +
+    '恰好 4 个模块，每模块恰好 3 个知识点，每知识点 1 个资源。\n' +
+    'description/keyPoints/commonMistakes 极简（每项不超过 12 字）。\n' +
+    '可省略 knowledgeTree。总时长 20-60 小时。'
   )
 
   const userLevel = level === 'beginner' ? '零基础' : level === 'intermediate' ? '有一定基础' : '进阶提升'
-  const userPrompt = '学习目标：' + learningGoal + '\n当前水平：' + userLevel + '\n每天学习时长：' + dailyHours + '小时\n请生成完整学习路径。'
+  const userPrompt =
+    '学习目标：' + learningGoal +
+    '\n当前水平：' + userLevel +
+    '\n每天学习时长：' + dailyHours + '小时' +
+    '\n请按规模约束输出紧凑 JSON 学习路径（短字段、少废话）。'
 
   return withRetry(async (attempt) => {
     const systemPrompt = systemPromptBase + (attempt > 0
-      ? '\n\n【重要】上一次输出无法解析。请只输出合法 JSON 对象，不要 markdown 代码块，不要额外说明。'
+      ? '\n\n【重要】上一次输出无法解析或超时。请输出更短的合法 JSON：4 模块×3 知识点×1 资源，字段极简。'
       : '')
     const result = await chatCompletion([
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
     ], {
       model: getDefaultModel(),
-      temperature: 0.3,
-      maxTokens: 16384,
-      timeoutMs: 300000,
+      temperature: 0.25,
+      // Compact roadmap fits well under 4k; streaming reduces Cloudflare 524 TTFB risk
+      maxTokens: 4096,
+      timeoutMs: 120000,
+      stream: true,
       signal: opts?.signal,
     })
     const raw = parseAndValidateAiJson(result, isLearningPathLike, '学习路径')
     return normalizeLearningPath(raw)
-  }, { retries: 2, label: '生成学习路径' })
+  }, { retries: 2, label: '生成学习路径', backoffMs: 1000 })
 }
 
 // ==================== 2. 学习计划生成 ====================
@@ -676,43 +681,85 @@ export async function generateStudyPlan(
   path: LearningPath,
   dailyHours: number,
   startDate: string,
-  opts?: { signal?: AbortSignal },
+  opts?: {
+    signal?: AbortSignal
+    /** fresh = first/replace period; continue = next rolling period */
+    mode?: 'fresh' | 'continue'
+    /** Prefer scheduling these remaining KPs (already filtered by caller). */
+    focusKnowledgePoints?: PlanKpRef[]
+    /** Existing last dayNumber; model may ignore — caller renumbers. */
+    dayNumberOffset?: number
+  },
 ): Promise<StudyPlan> {
+  const mode = opts?.mode || 'fresh'
   const systemPromptBase = await loadPrompt('planner',
     '你是学习计划生成引擎。\n' +
-    '规则：输出严格 JSON。\n' +
-    '每天不超过 dailyHours 小时。\n' +
-    '任务类型比例：learn 40% + practice 30% + review 20% + test 10%。\n' +
-    '每 5 天安排 1 天复习日。\n' +
-    '周末减负，多做复习和练习。\n' +
-    '每天任务不超过 3 个。'
+    '规则：只输出严格 JSON。\n' +
+    '只生成接下来 10-14 天（不要整条路径全排完）。\n' +
+    '每天不超过 dailyHours 小时，每天最多 3 个任务。\n' +
+    '字段保持简短；title 不超过 16 字。\n' +
+    'kpId/moduleId 必须使用输入中的真实 id。'
   )
 
   if (!path?.modules || path.modules.length === 0) throw new Error('学习路径没有模块，请重新生成')
-  const kpSummary = path.modules.flatMap(m =>
-    m.knowledgePoints.map(kp => kp.id + ': ' + kp.title + '(' + kp.estimatedHours + 'h)')
-  ).join('; ')
+
+  const focus = opts?.focusKnowledgePoints?.length
+    ? opts.focusKnowledgePoints
+    : path.modules.flatMap((m) =>
+        (m.knowledgePoints || []).map((kp) => ({
+          id: kp.id,
+          title: kp.title,
+          moduleId: m.id,
+          estimatedHours: typeof kp.estimatedHours === 'number' ? kp.estimatedHours : 2,
+        })),
+      )
+
+  if (!focus.length) {
+    throw new Error(mode === 'continue'
+      ? '没有剩余可排的知识点，无需续期'
+      : '没有可排入计划的知识点')
+  }
+
+  const kpSummary = summarizeKpsForPrompt(focus, 18)
+  const offset = Math.max(0, opts?.dayNumberOffset || 0)
+  const periodHint = mode === 'continue'
+    ? '\n这是续期计划：只排上述「待学知识点」，dayNumber 从 ' + (offset + 1) + ' 起编，开始日期 ' + startDate + '。不要重复已完成内容。'
+    : '\n这是近期计划（第一期）：优先覆盖靠前知识点，不要试图一次排完整路径。'
 
   return withRetry(async (attempt) => {
     const systemPrompt = systemPromptBase + (attempt > 0
-      ? '\n\n【重要】上一次输出无法解析。请只输出合法 JSON，字段包含 days 数组。'
+      ? '\n\n【重要】上一次失败。请输出更短 JSON：最多 10 天，每天最多 2 个任务。'
       : '')
     const result = await chatCompletion([{
       role: 'system',
       content: systemPrompt,
     }, {
       role: 'user',
-      content: '学习路径：' + path.title + '\n模块：' + path.modules.map(m => m.title).join('、') + '\n知识点摘要：' + kpSummary + '\n每天学习：' + dailyHours + '小时\n开始日期：' + startDate,
+      content:
+        '学习路径：' + path.title +
+        '\n模块：' + path.modules.map(m => m.title).join('、') +
+        '\n待学知识点：' + kpSummary +
+        '\n每天学习：' + dailyHours + '小时' +
+        '\n开始日期：' + startDate +
+        periodHint +
+        '\n只生成 10-14 天计划。',
     }], {
-      temperature: 0.3,
-      timeoutMs: 240000,
+      temperature: 0.25,
+      maxTokens: 3500,
+      timeoutMs: 120000,
+      stream: true,
       signal: opts?.signal,
     })
     const raw = parseAndValidateAiJson(result, isStudyPlanLike, '学习计划')
     const plan = normalizeStudyPlan(raw)
     if (!plan.id) plan.id = 'plan-' + Date.now()
+    if (Array.isArray(plan.days) && plan.days.length > 14) {
+      plan.days = plan.days.slice(0, 14)
+      const last = plan.days[plan.days.length - 1]
+      if (last?.date) plan.endDate = last.date
+    }
     return plan
-  }, { retries: 2, label: '生成学习计划' })
+  }, { retries: 2, label: '生成学习计划', backoffMs: 1000 })
 }
 
 // ==================== 3. AI 教学 ====================
@@ -809,16 +856,22 @@ export async function generateExercises(
     const systemPrompt = systemPromptBase + (attempt > 0
       ? '\n\n【重要】上一次输出无法解析。请只输出 {"exercises":[...]} JSON。'
       : '')
+    const safeCount = Math.min(Math.max(count, 1), 4)
     const result = await chatCompletion([{
       role: 'system',
       content: systemPrompt,
     }, {
       role: 'user',
-      content: '知识点：' + kp.title + ' - ' + kp.description + '\n生成 ' + count + ' 道练习题。',
-    }])
+      content: '知识点：' + kp.title + ' - ' + kp.description + '\n生成 ' + safeCount + ' 道练习题；解析各不超过 40 字。',
+    }], {
+      temperature: 0.4,
+      maxTokens: 2800,
+      timeoutMs: 90000,
+      stream: true,
+    })
     const raw = parseAndValidateAiJson(result, isExerciseArray, '练习题')
     return normalizeExercises(raw, kp.id)
-  }, { retries: 2, label: '生成练习题' })
+  }, { retries: 2, label: '生成练习题', backoffMs: 800 })
 }
 
 // ==================== 5. 作业评分 ====================
@@ -844,15 +897,20 @@ export async function gradeSubmission(
       content: systemPrompt,
     }, {
       role: 'user',
-      content: '题目：' + exercise.question + '\n正确答案：' + exercise.correctAnswer + '\n学生回答：' + studentAnswer + '\n满分：' + exercise.score,
-    }])
+      content: '题目：' + exercise.question + '\n正确答案：' + exercise.correctAnswer + '\n学生回答：' + studentAnswer + '\n满分：' + exercise.score + '\n评语控制在 80 字内。',
+    }], {
+      temperature: 0.2,
+      maxTokens: 600,
+      timeoutMs: 60000,
+      stream: true,
+    })
     const raw = parseAndValidateAiJson(result, isGradeResult, '评分结果')
     return {
       isCorrect: Boolean(raw.isCorrect),
       score: asNumber(raw.score, 0),
       feedback: asString(raw.feedback, '已评分'),
     }
-  }, { retries: 1, label: '评分' })
+  }, { retries: 1, label: '评分', backoffMs: 600 })
 }
 
 // ==================== 6. 每日总结 ====================
@@ -885,10 +943,12 @@ export async function generateDailySummary(
       content: systemPrompt,
     }, {
       role: 'user',
-      content: '今日学习内容：' + (learnedPoints.join('、') || '无') + '\n学习时长：' + completedHours + '小时\n测验分数：' + (quizScores.join(', ') || '无') + '分（平均 ' + avgScore + ' 分）',
+      content: '今日学习内容：' + (learnedPoints.join('、') || '无') + '\n学习时长：' + completedHours + '小时\n测验分数：' + (quizScores.join(', ') || '无') + '分（平均 ' + avgScore + ' 分）\n请输出紧凑 JSON，建议每条不超过 20 字。',
     }], {
       temperature: 0.3,
-      timeoutMs: 180000,
+      maxTokens: 1200,
+      timeoutMs: 90000,
+      stream: true,
       signal: opts?.signal,
     })
     const raw = parseAndValidateAiJson(result, isDailySummaryLike, '每日总结')
@@ -897,7 +957,7 @@ export async function generateDailySummary(
     if (!summary.completedHours) summary.completedHours = completedHours
     if (!summary.quizScores.length) summary.quizScores = quizScores
     return summary
-  }, { retries: 2, label: '生成每日总结' })
+  }, { retries: 2, label: '生成每日总结', backoffMs: 800 })
 }
 
 // ==================== 7. RAG - 文档生成 ====================
@@ -906,12 +966,10 @@ export async function generateKnowledgeDoc(
 ): Promise<string> {
   const systemPrompt = await loadPrompt('rag',
     '你是文档生成引擎。\n' +
-    '规则：输出 Markdown 格式。\n' +
-    '结构：概念 -> 原理 -> 案例 -> 代码 -> 总结 -> 重点 -> 常见错误 -> 练习 -> 延伸阅读。\n' +
-    '面向初学者，避免过度专业术语。\n' +
-    '代码示例必须可运行。\n' +
-    '使用 Mermaid 图辅助理解。\n' +
-    '长度 1000-3000 字。'
+    '规则：输出 Markdown。\n' +
+    '结构：概念 -> 原理 -> 小例子 -> 重点 -> 常见错误。\n' +
+    '面向初学者；代码简短可运行。\n' +
+    '正文 500-900 字，避免冗长。'
   )
 
   const result = await chatCompletion([{
@@ -919,8 +977,13 @@ export async function generateKnowledgeDoc(
     content: systemPrompt,
   }, {
     role: 'user',
-    content: '知识点：' + kp.title + '\n描述：' + kp.description + '\n核心要点：' + kp.keyPoints.join('、'),
-  }])
+    content: '知识点：' + kp.title + '\n描述：' + kp.description + '\n核心要点：' + kp.keyPoints.join('、') + '\n请输出精简文档。',
+  }], {
+    temperature: 0.45,
+    maxTokens: 2200,
+    timeoutMs: 120000,
+    stream: true,
+  })
 
   // Docs are Markdown, not JSON — return as-is (strip accidental fences)
   return result.replace(/^```(?:markdown|md)?\s*/i, '').replace(/```\s*$/i, '').trim()
@@ -947,13 +1010,18 @@ export async function generateMermaidDiagram(
       content: systemPrompt,
     }, {
       role: 'user',
-      content: '主题：' + topic + '\n描述：' + description,
-    }])
+      content: '主题：' + topic + '\n描述：' + description + '\n只输出 1 个简洁 flowchart。',
+    }], {
+      temperature: 0.3,
+      maxTokens: 1000,
+      timeoutMs: 60000,
+      stream: true,
+    })
     const raw = parseAndValidateAiJson(result, isDiagramArray, '流程图')
     const diagrams = normalizeDiagrams(raw)
     if (diagrams.length === 0) throw new AiJsonError('流程图为空', result)
     return diagrams
-  }, { retries: 1, label: '生成流程图' })
+  }, { retries: 1, label: '生成流程图', backoffMs: 600 })
 }
 
 // ==================== 9. 情感陪伴 ====================
@@ -983,7 +1051,7 @@ export async function chatWithCompanion(
     { role: 'system', content: systemPrompt },
     ...history.map((m) => ({ role: m.role, content: m.content })),
     { role: 'user', content: userMessage },
-  ], { temperature: 0.85, maxTokens: 1024 })
+  ], { temperature: 0.85, maxTokens: 700, timeoutMs: 60000, stream: true })
 
   return result.trim() || '我在这儿呢。想说什么都可以。'
 }

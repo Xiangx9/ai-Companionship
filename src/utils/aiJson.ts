@@ -133,12 +133,29 @@ export function parseAndValidateAiJson<T>(
   throw new AiJsonError(`${label} 结构不符合预期`, text)
 }
 
+function isRetryableAiFailure(err: unknown): boolean {
+  if (err instanceof AiJsonError) return true
+  const code = err && typeof err === 'object' ? String((err as { code?: unknown }).code || '') : ''
+  const msg = err instanceof Error ? err.message : String(err || '')
+  if (code === 'timeout' || code === 'empty') return true
+  // Cloudflare / gateway flakes: worth one or two automatic retries
+  if (code === 'http' && /\b(524|504|502|503|429)\b/.test(msg)) return true
+  return /JSON|结构|解析|空内容|empty|timeout|超时|\b524\b|\b504\b|\b502\b|\b503\b|\b429\b|Gateway Time-out|upstream_timeout|A Timeout Occurred|rate.?limit|暂时不可用/i.test(
+    msg,
+  )
+}
+
+function delay(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms))
+}
+
 export async function withRetry<T>(
   fn: (attempt: number) => Promise<T>,
-  opts?: { retries?: number; label?: string },
+  opts?: { retries?: number; label?: string; backoffMs?: number },
 ): Promise<T> {
   const retries = opts?.retries ?? 2
   const label = opts?.label ?? 'AI 请求'
+  const backoffMs = opts?.backoffMs ?? 800
   let lastError: unknown
 
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -151,10 +168,10 @@ export async function withRetry<T>(
       if (/aborted|AbortError/i.test(msg) || (err as { code?: string })?.code === 'aborted') {
         break
       }
-      const retryable =
-        err instanceof AiJsonError ||
-        /JSON|结构|解析|空内容|empty|timeout|超时/i.test(msg)
-      if (!retryable || attempt === retries) break
+      if (!isRetryableAiFailure(err) || attempt === retries) break
+      // brief backoff; longer after gateway timeouts
+      const gate = /\b(524|504|502|503)\b|timeout|超时/i.test(msg)
+      await delay(backoffMs * (attempt + 1) * (gate ? 2 : 1))
     }
   }
 

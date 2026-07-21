@@ -26,12 +26,6 @@ const levelOptions = [
 
 const fields = ['编程', 'AI', '数学', '英语', '摄影', '投资', '心理学', '历史', '法律', '考研']
 
-const features = [
-  { icon: '🗺️', title: '知识图谱', desc: '结构化路径，一眼看清学什么' },
-  { icon: '🤖', title: 'AI 老师', desc: '讲解、提问、评分一体' },
-  { icon: '📈', title: '学习报告', desc: '进度、薄弱点自动整理' },
-  { icon: '🌙', title: '情感陪伴', desc: '学累了也能先缓一缓' },
-]
 
 async function startLearning() {
   if (!input.value.trim()) {
@@ -266,19 +260,6 @@ function progressPercent(proj: LearningProject) {
           </div>
         </button>
 
-        <section class="feature-panel surface">
-          <div class="section-title">能力概览</div>
-          <div class="feature-list">
-            <div v-for="item in features" :key="item.title" class="feature-item">
-              <div class="feature-icon">{{ item.icon }}</div>
-              <div>
-                <div class="feature-title">{{ item.title }}</div>
-                <div class="feature-desc">{{ item.desc }}</div>
-              </div>
-            </div>
-          </div>
-        </section>
-
         <section v-if="recentProjects.length" class="recent-panel surface">
           <div class="recent-head">
             <div class="section-title">最近项目</div>
@@ -327,7 +308,6 @@ function progressPercent(proj: LearningProject) {
 
 .hero,
 .companion-card,
-.feature-panel,
 .recent-panel {
   padding: 22px;
 }
@@ -727,7 +707,6 @@ function progressPercent(proj: LearningProject) {
   padding: 4px 8px;
 }
 
-.feature-list,
 .recent-list {
   display: flex;
   flex-direction: column;
@@ -735,7 +714,6 @@ function progressPercent(proj: LearningProject) {
   margin-top: 14px;
 }
 
-.feature-item,
 .recent-item {
   display: flex;
   gap: 12px;
@@ -746,24 +724,13 @@ function progressPercent(proj: LearningProject) {
   background: rgba(255,255,255,0.025);
 }
 
-.feature-icon {
-  width: 34px;
-  height: 34px;
-  border-radius: 10px;
-  display: grid;
-  place-items: center;
-  background: rgba(79,140,255,0.1);
-  flex-shrink: 0;
-}
 
-.feature-title,
 .recent-name {
   font-size: 13px;
   font-weight: 650;
   color: var(--text);
 }
 
-.feature-desc,
 .recent-meta {
   margin-top: 3px;
   font-size: 12px;
@@ -857,7 +824,6 @@ function progressPercent(proj: LearningProject) {
   }
   .hero,
   .companion-card,
-  .feature-panel,
   .recent-panel {
     padding: 16px;
   }

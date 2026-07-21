@@ -85,6 +85,23 @@ export function describeAiError(err: unknown): AiErrorInfo {
     }
   }
 
+  // Cloudflare / reverse-proxy timeouts & gateway errors
+  if (
+    /\b524\b|\b504\b|\b502\b|\b503\b|error code:\s*524|upstream_timeout|网关超时|Gateway Time-out|A Timeout Occurred/i.test(
+      raw,
+    )
+  ) {
+    const is524 = /\b524\b|error code:\s*524|A Timeout Occurred/i.test(raw)
+    return {
+      code: 'timeout',
+      title: is524 ? '上游超时 (524)' : '网关超时',
+      message: is524
+        ? 'AI 网关在 Cloudflare 侧超时（524）：上游模型响应过慢或卡住。请稍后重试；生成路径可改用更快模型，或在设置里换更稳定的 Base URL。'
+        : 'AI 网关超时或暂时不可用，请稍后重试；若频繁出现，请检查网络或更换模型/接口。',
+      retryable: true,
+    }
+  }
+
   if (code === 'http' || /AI 请求失败|HTTP|status\s*\d+/i.test(raw)) {
     return {
       code: 'http',

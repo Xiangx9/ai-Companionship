@@ -2,13 +2,21 @@
  * Project lifecycle actions (create / switch / delete / plan).
  */
 import type { ComputedRef, Ref } from 'vue'
-import type { LearningProject } from '@/types/learning'
+import type { LearningProject, StudyPlan } from '@/types/learning'
 import { generateLearningPath, generateStudyPlan } from '@/services/aiEngine'
 import {
   uid,
   listKnowledgePoints,
   isAbortError,
 } from './helpers'
+import {
+  buildFreshStudyPlanShell,
+  canContinueStudyPlan,
+  mergeStudyPlanPeriods,
+  nextPeriodStart,
+  remainingKnowledgePoints,
+  type PlanGenerateMode,
+} from '@/utils/studyPlanRoll'
 
 export type ProjectApiDeps = {
   projects: Ref<LearningProject[]>
@@ -91,21 +99,78 @@ export function createProjectApi(deps: ProjectApiDeps) {
     persist()
   }
 
-  async function generatePlan(dailyHours: number = 2) {
+  /**
+   * Rolling plan:
+   * - fresh: replace with a new 10–14 day period (keeps path; drops old plan days)
+   * - continue: append next period after last day; preserves completedTasks history
+   */
+  async function generatePlan(
+    dailyHours: number = 2,
+    mode: PlanGenerateMode = 'fresh',
+  ): Promise<StudyPlan | null> {
     const project = activeProject.value
     if (!project) return null
-    const controller = beginGeneration('1/3 分析学习路径...')
+
+    const remaining = remainingKnowledgePoints(project.path, project.progress)
+    if (mode === 'continue') {
+      if (!canContinueStudyPlan(project.path, project.progress, project.studyPlan)) {
+        throw new Error(
+          remaining.length === 0
+            ? '当前路径知识点已全部完成，无需续期'
+            : '请先生成近期计划，再续期',
+        )
+      }
+    } else if (remaining.length === 0) {
+      // Allow restart only if there is something left; if all done, still error
+      throw new Error('当前路径知识点已全部完成，无需再生成计划')
+    }
+
+    const existing = project.studyPlan
+    const { startDate, dayNumberOffset } =
+      mode === 'continue' && existing
+        ? nextPeriodStart(existing)
+        : { startDate: new Date().toISOString().split('T')[0], dayNumberOffset: 0 }
+
+    const controller = beginGeneration(
+      mode === 'continue' ? '1/3 分析待学知识点...' : '1/3 分析学习路径...',
+    )
     try {
-      generateProgress.value = '2/3 按每日学时编排任务...'
-      const plan = await generateStudyPlan(
+      generateProgress.value =
+        mode === 'continue' ? '2/3 编排下一期任务...' : '2/3 按每日学时编排近期任务...'
+
+      const incoming = await generateStudyPlan(
         project.path,
         dailyHours,
-        new Date().toISOString().split('T')[0],
-        { signal: controller.signal },
+        startDate,
+        {
+          signal: controller.signal,
+          mode,
+          focusKnowledgePoints: remaining,
+          dayNumberOffset,
+        },
       )
       if (controller.signal.aborted) throw Object.assign(new Error('AI 请求已取消'), { code: 'aborted' })
+
       generateProgress.value = '3/3 保存学习计划...'
-      plan.projectId = project.id
+      let plan: StudyPlan
+      if (mode === 'continue' && existing) {
+        plan = mergeStudyPlanPeriods(existing, incoming, {
+          dayNumberOffset,
+          startDate,
+          dailyHours,
+        })
+        plan.projectId = project.id
+        if (!/续期|近期/.test(plan.title || '')) {
+          plan.title = (plan.title || '学习计划') + ' · 已续期'
+        }
+      } else {
+        plan = buildFreshStudyPlanShell(incoming, {
+          projectId: project.id,
+          dailyHours,
+          startDate,
+        })
+      }
+
       plan.days = (plan.days ?? []).map((d) => ({
         ...d,
         completedTasks: Array.isArray(d.completedTasks) ? d.completedTasks : [],

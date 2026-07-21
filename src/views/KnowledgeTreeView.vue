@@ -10,6 +10,7 @@ import TodayLearningCard from '@/components/TodayLearningCard.vue'
 import type { KnowledgePoint, LearningModule } from '@/types/learning'
 import { toastError, toastSuccess, toastWarning } from '@/utils/toast'
 import { describeAiError } from '@/utils/aiError'
+import { canContinueStudyPlan, remainingKnowledgePoints } from '@/utils/studyPlanRoll'
 import { downloadTextFile } from '@/utils/storage'
 
 const showExportMenu = ref(false)
@@ -178,15 +179,42 @@ const sortedSummaries = computed(() => {
   return [...list].sort((a, b) => String(b.date).localeCompare(String(a.date)))
 })
 
-async function generatePlan() {
+const lastPlanMode = ref<'fresh' | 'continue'>('fresh')
+
+const canContinuePlan = computed(() => {
+  const p = project.value
+  if (!p) return false
+  return canContinueStudyPlan(p.path, p.progress, p.studyPlan)
+})
+
+const remainingKpCount = computed(() => {
+  const p = project.value
+  if (!p) return 0
+  return remainingKnowledgePoints(p.path, p.progress).length
+})
+
+const planPeriodLabel = computed(() => {
+  const days = project.value?.studyPlan?.days?.length || 0
+  if (!days) return ''
+  const periods = Math.max(1, Math.ceil(days / 14))
+  return `已排 ${days} 天 · 约 ${periods} 期`
+})
+
+async function generatePlan(mode: 'fresh' | 'continue' = 'fresh') {
+  // restart confirm
+  if (mode === 'fresh' && project.value?.studyPlan?.days?.length) {
+    const ok = window.confirm('重新开始会替换当前学习计划（已完成勾选会清空）。确定继续？')
+    if (ok === false) return
+  }
+  lastPlanMode.value = mode
   planLoading.value = true
   planError.value = ''
   planErrorTitle.value = ''
   planErrorRetryable.value = true
   store.clearGenerateError()
   try {
-    await store.generatePlan(Number(dailyHours.value) || 2)
-    toastSuccess('学习计划已生成')
+    await store.generatePlan(Number(dailyHours.value) || 2, mode)
+    toastSuccess(mode === 'continue' ? '下一期计划已接上' : '近期学习计划已生成')
   } catch (e) {
     if (store.isGenerationAborted(e)) {
       planError.value = ''
@@ -201,6 +229,10 @@ async function generatePlan() {
   } finally {
     planLoading.value = false
   }
+}
+
+function retryPlanGeneration() {
+  return generatePlan(lastPlanMode.value)
 }
 
 function cancelPlanGeneration() {
@@ -522,9 +554,33 @@ function handleDetailNext(kpId: string) {
                   </select>
                 </label>
                 <div class="plan-actions">
-                  <button class="generate-plan-btn" type="button" :disabled="planLoading" @click="generatePlan()">
-                    {{ planLoading ? (store.generateProgress || '生成中...') : (project.studyPlan ? '重新生成计划' : 'AI 生成每日计划') }}
+                  <button
+                    v-if="!project.studyPlan"
+                    class="generate-plan-btn"
+                    type="button"
+                    :disabled="planLoading || remainingKpCount === 0"
+                    @click="generatePlan('fresh')"
+                  >
+                    {{ planLoading ? (store.generateProgress || '生成中...') : '生成近期计划' }}
                   </button>
+                  <template v-else>
+                    <button
+                      class="generate-plan-btn"
+                      type="button"
+                      :disabled="planLoading || !canContinuePlan"
+                      @click="generatePlan('continue')"
+                    >
+                      {{ planLoading && lastPlanMode === 'continue' ? (store.generateProgress || '续期中...') : '生成下一期' }}
+                    </button>
+                    <button
+                      class="btn btn-ghost plan-restart-btn"
+                      type="button"
+                      :disabled="planLoading || remainingKpCount === 0"
+                      @click="generatePlan('fresh')"
+                    >
+                      {{ planLoading && lastPlanMode === 'fresh' ? '生成中...' : '重新开始' }}
+                    </button>
+                  </template>
                   <button
                     v-if="planLoading"
                     class="btn btn-ghost"
@@ -533,6 +589,11 @@ function handleDetailNext(kpId: string) {
                   >取消</button>
                 </div>
               </div>
+              <p v-if="project.studyPlan" class="plan-roll-hint">
+                {{ planPeriodLabel }}
+                <template v-if="canContinuePlan"> · 学完本期后可续排剩余 {{ remainingKpCount }} 个知识点</template>
+                <template v-else-if="remainingKpCount === 0"> · 知识点已全部完成</template>
+              </p>
 
               <div v-if="planLoading" class="gen-inline-panel" aria-live="polite">
                 <div class="gen-inline-status">
@@ -559,14 +620,14 @@ function handleDetailNext(kpId: string) {
                     v-if="planErrorRetryable"
                     class="btn btn-primary"
                     type="button"
-                    @click="generatePlan"
+                    @click="retryPlanGeneration"
                   >重试</button>
                   <button class="btn btn-ghost" type="button" @click="dismissPlanError">关闭</button>
                 </div>
               </div>
 
               <div v-if="!project.studyPlan && !planLoading" class="plan-empty">
-                <p>选择每日学时后生成可执行学习计划</p>
+                <p>选择每日学时后生成近 10–14 天计划；学完后可再生成下一期，不会丢掉已完成记录。</p>
               </div>
               <div v-if="project.studyPlan" class="plan-list" :class="{ dimmed: planLoading }">
                 <div v-for="day in project.studyPlan.days" :key="day.dayNumber" class="plan-day">
@@ -1356,6 +1417,17 @@ function handleDetailNext(kpId: string) {
   flex-shrink: 0;
   font-size: 11px;
   color: #ff9aa5;
+}
+
+.plan-roll-hint {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.plan-restart-btn {
+  font-size: 12px;
 }
 
 .plan-toolbar {
