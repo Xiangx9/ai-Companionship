@@ -106,6 +106,10 @@ export interface LearningProgress {
   notes?: string
   quizScore?: number
   practiceAttempts?: number
+  /** Count of student teaching interactions (answer / quick-action) */
+  teachInteractions?: number
+  /** Count of practice items that met pass threshold */
+  practicePassCount?: number
   exercises?: any[]  // AI 生成的练习及提交结果
   generatedDocs?: string  // AI 生成的知识点文档(Markdown)
   generatedDiagrams?: { type: string; code: string; caption: string }[]  // AI 生成的 Mermaid 图
@@ -128,7 +132,10 @@ export type TeachingStep = 'explaining' | 'giving_example' | 'drawing_diagram' |
 export interface TeachingMessage {
   id: string
   role: 'teacher' | 'student'
+  /** Full text used for AI context and default rendering */
   content: string
+  /** Optional short UI label (e.g. quick-action chips) */
+  displayContent?: string
   type: 'text' | 'code' | 'diagram' | 'question' | 'feedback'
   timestamp: string
 }
@@ -183,6 +190,21 @@ export interface DailySummary {
 }
 
 // ==================== 学习项目 ====================
+export interface WrongAnswerItem {
+  id: string
+  kpId: string
+  /** Where the miss was recorded */
+  source: 'quiz' | 'practice' | 'manual'
+  score?: number
+  maxScore?: number
+  note?: string
+  createdAt: string
+  /** Cleared / down-weighted when reviewed successfully */
+  resolvedAt?: string
+  /** How many times it was marked resolved (history retained) */
+  resolveCount?: number
+}
+
 export interface LearningProject {
   id: string
   name: string
@@ -193,6 +215,8 @@ export interface LearningProject {
   studyPlan?: StudyPlan
   dailySummaries: DailySummary[]
   teachingSessions: TeachingSession[]
+  /** Wrong / weak items queue (history kept even after resolve) */
+  wrongAnswers?: WrongAnswerItem[]
   createdAt: string
   updatedAt: string
 }

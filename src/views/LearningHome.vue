@@ -4,7 +4,9 @@ import { ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { useLearningStore } from '@/store/learning'
 import { toastError, toastWarning } from '@/utils/toast'
+import { describeAiError } from '@/utils/aiError'
 import type { LearningProject } from '@/types/learning'
+import TodayLearningCard from '@/components/TodayLearningCard.vue'
 
 const router = useRouter()
 const store = useLearningStore()
@@ -13,6 +15,8 @@ const input = ref('')
 const level = ref<'beginner' | 'intermediate' | 'advanced'>('beginner')
 const loading = ref(false)
 const error = ref('')
+const errorTitle = ref('')
+const errorRetryable = ref(true)
 
 const levelOptions = [
   { value: 'beginner' as const, label: '零基础', icon: '🌱', hint: '从基础概念开始' },
@@ -32,22 +36,30 @@ const features = [
 async function startLearning() {
   if (!input.value.trim()) {
     error.value = '请输入你想学习的内容'
+    errorTitle.value = '提示'
+    errorRetryable.value = false
     return
   }
   loading.value = true
   error.value = ''
+  errorTitle.value = ''
+  errorRetryable.value = true
+  store.clearGenerateError()
   try {
     const project = await store.createProject(input.value.trim(), level.value)
     if (project) router.push('/learn/' + project.id)
   } catch (err) {
     if (store.isGenerationAborted(err)) {
       error.value = ''
+      errorTitle.value = ''
       toastWarning('已取消生成')
       return
     }
-    const msg = err instanceof Error ? err.message : '生成失败，请重试'
-    error.value = msg
-    toastError(msg)
+    const info = describeAiError(err)
+    error.value = info.message
+    errorTitle.value = info.title
+    errorRetryable.value = info.retryable
+    toastError(info.message)
   } finally {
     loading.value = false
   }
@@ -69,13 +81,31 @@ const recentProjects = computed(() => {
 
 const continueEntry = computed(() => store.getLatestContinueProject())
 
-function continueLearning() {
+const todayCard = computed(() => {
   const entry = continueEntry.value
-  if (!entry) return
+  if (!entry) return null
+  return store.getTodayLearningCard(entry.project.id)
+})
+
+function openTodayReview() {
+  const entry = continueEntry.value
+  const review = todayCard.value?.reviewItem
+  if (!entry || !review) return
   store.setActiveProject(entry.project.id)
   router.push({
     path: '/learn/' + entry.project.id,
-    query: { kp: entry.target.kpId, resume: '1' },
+    query: { kp: review.kpId, resume: '1' },
+  })
+}
+
+function continueLearning() {
+  const entry = continueEntry.value
+  if (!entry) return
+  const kpId = todayCard.value?.kpId || entry.target.kpId
+  store.setActiveProject(entry.project.id)
+  router.push({
+    path: '/learn/' + entry.project.id,
+    query: { kp: kpId, resume: '1' },
   })
 }
 
@@ -83,6 +113,15 @@ function cancelCreate() {
   store.cancelGeneration()
   loading.value = false
   error.value = ''
+  errorTitle.value = ''
+  errorRetryable.value = true
+}
+
+function dismissError() {
+  error.value = ''
+  errorTitle.value = ''
+  errorRetryable.value = true
+  store.clearGenerateError()
 }
 
 function formatDate(value?: string) {
@@ -111,14 +150,15 @@ function progressPercent(proj: LearningProject) {
         <h1 class="hero-title">AI Learning OS</h1>
         <p class="hero-desc">输入任何想学的内容，AI 自动规划路径、讲解知识点，并帮你持续推进。</p>
 
-        <div v-if="continueEntry" class="continue-banner">
-          <div class="continue-main">
-            <div class="continue-kicker">继续上次学习</div>
-            <div class="continue-title">{{ continueEntry.project.name }}</div>
-            <div class="continue-sub">下一步：{{ continueEntry.target.kpTitle }}</div>
-          </div>
-          <button class="btn btn-secondary" type="button" @click="continueLearning">继续学习</button>
-        </div>
+        <TodayLearningCard
+          v-if="todayCard"
+          class="home-today-card"
+          :card="todayCard"
+          show-project
+          cta-label="继续学习"
+          @continue="continueLearning"
+          @review="openTodayReview"
+        />
 
         <div class="composer">
           <div class="composer-row">
@@ -166,7 +206,39 @@ function progressPercent(proj: LearningProject) {
             </div>
           </div>
 
-          <p v-if="error" class="error-text">{{ error }}</p>
+          <div v-if="loading" class="gen-panel" aria-live="polite">
+            <div class="gen-status">
+              <span class="spinner"></span>
+              <div>
+                <strong>{{ store.generateProgress || '正在生成学习路径...' }}</strong>
+                <p>通常需要 10–40 秒，可随时取消；生成中会预览路径骨架。</p>
+              </div>
+            </div>
+            <div class="path-skeleton" aria-hidden="true">
+              <div v-for="i in 3" :key="i" class="skeleton-mod">
+                <div class="sk-line sk-title"></div>
+                <div class="sk-line"></div>
+                <div class="sk-line sk-short"></div>
+                <div class="sk-chips">
+                  <span></span><span></span><span></span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div v-else-if="error" class="error-panel" role="alert">
+            <div class="error-panel-title">{{ errorTitle || '生成失败' }}</div>
+            <p class="error-panel-msg">{{ error }}</p>
+            <div class="error-panel-actions">
+              <button
+                v-if="errorRetryable"
+                class="btn btn-primary"
+                type="button"
+                @click="startLearning"
+              >重试</button>
+              <button class="btn btn-ghost" type="button" @click="dismissError">关闭</button>
+            </div>
+          </div>
         </div>
 
         <div class="field-row">
@@ -300,6 +372,10 @@ function progressPercent(proj: LearningProject) {
   font-size: 15px;
   line-height: 1.7;
   max-width: 52ch;
+}
+
+.home-today-card {
+  margin-bottom: 16px;
 }
 
 .continue-banner {
@@ -484,6 +560,109 @@ function progressPercent(proj: LearningProject) {
   margin: 0;
   color: #ff8b97;
   font-size: 12px;
+}
+
+.gen-panel,
+.error-panel {
+  margin-top: 4px;
+  padding: 14px 14px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(79, 140, 255, 0.22);
+  background: rgba(10, 16, 28, 0.72);
+}
+
+.error-panel {
+  border-color: rgba(255, 120, 140, 0.35);
+  background: rgba(42, 16, 24, 0.55);
+}
+
+.gen-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.gen-status strong {
+  display: block;
+  color: #e8f0ff;
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+
+.gen-status p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.path-skeleton {
+  display: grid;
+  gap: 10px;
+}
+
+.skeleton-mod {
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.sk-line {
+  height: 10px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(255,255,255,0.06), rgba(255,255,255,0.14), rgba(255,255,255,0.06));
+  background-size: 200% 100%;
+  animation: sk-shimmer 1.2s ease-in-out infinite;
+  margin-bottom: 8px;
+}
+
+.sk-title {
+  width: 42%;
+  height: 12px;
+}
+
+.sk-short {
+  width: 58%;
+}
+
+.sk-chips {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.sk-chips span {
+  width: 52px;
+  height: 18px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+@keyframes sk-shimmer {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+
+.error-panel-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: #ffb4be;
+  margin-bottom: 6px;
+}
+
+.error-panel-msg {
+  margin: 0 0 12px;
+  color: #ffd0d6;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.error-panel-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .side-stack {

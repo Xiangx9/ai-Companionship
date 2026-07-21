@@ -23,6 +23,11 @@ const router = createRouter({
       name: 'companion',
       component: () => import('@/views/CompanionView.vue'),
     },
+    {
+      path: '/settings',
+      name: 'settings',
+      component: () => import('@/views/SettingsView.vue'),
+    },
   ],
 })
 

@@ -6,8 +6,10 @@ import { useLearningStore } from '@/store/learning'
 import RingProgress from '@/components/RingProgress.vue'
 import KnowledgeCard from '@/components/KnowledgeCard.vue'
 import KnowledgeDetailView from '@/components/KnowledgeDetailView.vue'
+import TodayLearningCard from '@/components/TodayLearningCard.vue'
 import type { KnowledgePoint, LearningModule } from '@/types/learning'
 import { toastError, toastSuccess, toastWarning } from '@/utils/toast'
+import { describeAiError } from '@/utils/aiError'
 import { downloadTextFile } from '@/utils/storage'
 
 const showExportMenu = ref(false)
@@ -157,10 +159,17 @@ function moduleDoneCount(mod: LearningModule) {
 
 const planLoading = ref(false)
 const reportLoading = ref(false)
+const planError = ref('')
+const planErrorTitle = ref('')
+const planErrorRetryable = ref(true)
+const reportError = ref('')
+const reportErrorTitle = ref('')
+const reportErrorRetryable = ref(true)
 const dailyHours = ref(2)
 const planHoursOptions = [1, 1.5, 2, 3, 4]
 
 const continueTarget = computed(() => store.getContinueTarget(project.value?.id))
+const todayCard = computed(() => store.getTodayLearningCard(project.value?.id))
 const learningStats = computed(() => store.getProjectLearningStats(project.value?.id))
 const weakQueue = computed(() => store.getWeakPointQueue(project.value?.id))
 const todayPlan = computed(() => learningStats.value?.planDay ?? null)
@@ -171,15 +180,24 @@ const sortedSummaries = computed(() => {
 
 async function generatePlan() {
   planLoading.value = true
+  planError.value = ''
+  planErrorTitle.value = ''
+  planErrorRetryable.value = true
+  store.clearGenerateError()
   try {
     await store.generatePlan(Number(dailyHours.value) || 2)
     toastSuccess('学习计划已生成')
   } catch (e) {
     if (store.isGenerationAborted(e)) {
+      planError.value = ''
       toastWarning('已取消生成学习计划')
       return
     }
-    toastError(e instanceof Error ? e.message : '生成学习计划失败')
+    const info = describeAiError(e)
+    planError.value = info.message
+    planErrorTitle.value = info.title
+    planErrorRetryable.value = info.retryable
+    toastError(info.message)
   } finally {
     planLoading.value = false
   }
@@ -188,12 +206,33 @@ async function generatePlan() {
 function cancelPlanGeneration() {
   store.cancelGeneration()
   planLoading.value = false
+  planError.value = ''
+  planErrorTitle.value = ''
+}
+
+function dismissPlanError() {
+  planError.value = ''
+  planErrorTitle.value = ''
+  planErrorRetryable.value = true
+  store.clearGenerateError()
+}
+
+function openTodayReview() {
+  if (!project.value || !todayCard.value?.reviewItem) return
+  const found = store.findModuleForKp(project.value.path, todayCard.value.reviewItem.kpId)
+  if (!found) return
+  openKP(found.module, found.kp)
+}
+
+function markWeakResolved(kpId: string) {
+  store.resolveWrongAnswer(kpId)
 }
 
 function continueLearningNow() {
-  const target = continueTarget.value
-  if (!target || !project.value) return
-  const found = store.findModuleForKp(project.value.path, target.kpId)
+  if (!project.value) return
+  const kpId = todayCard.value?.kpId || continueTarget.value?.kpId
+  if (!kpId) return
+  const found = store.findModuleForKp(project.value.path, kpId)
   if (!found) return
   openKP(found.module, found.kp)
 }
@@ -224,15 +263,24 @@ function dayProgress(day: { tasks?: any[]; completedTasks?: string[] }) {
 
 async function generateDailyReport() {
   reportLoading.value = true
+  reportError.value = ''
+  reportErrorTitle.value = ''
+  reportErrorRetryable.value = true
+  store.clearGenerateError()
   try {
     const summary = await store.generateDailyReport()
     if (summary) toastSuccess('今日学习报告已更新')
   } catch (e) {
     if (store.isGenerationAborted(e)) {
+      reportError.value = ''
       toastWarning('已取消生成学习报告')
       return
     }
-    toastError(e instanceof Error ? e.message : '生成学习报告失败')
+    const info = describeAiError(e)
+    reportError.value = info.message
+    reportErrorTitle.value = info.title
+    reportErrorRetryable.value = info.retryable
+    toastError(info.message)
   } finally {
     reportLoading.value = false
   }
@@ -241,6 +289,15 @@ async function generateDailyReport() {
 function cancelReportGeneration() {
   store.cancelGeneration()
   reportLoading.value = false
+  reportError.value = ''
+  reportErrorTitle.value = ''
+}
+
+function dismissReportError() {
+  reportError.value = ''
+  reportErrorTitle.value = ''
+  reportErrorRetryable.value = true
+  store.clearGenerateError()
 }
 
 function openTodayPlanTask(task: { kpId: string }) {
@@ -397,22 +454,34 @@ function handleDetailNext(kpId: string) {
             <div v-else>
               <div v-if="weakQueue.length" class="weak-queue">
                 <div class="weak-queue-head">
-                  <strong>薄弱复习</strong>
+                  <strong>错题 / 薄弱复习</strong>
                   <span>{{ weakQueue.length }} 项</span>
                 </div>
-                <button
+                <div
                   v-for="item in weakQueue.slice(0, 5)"
                   :key="item.kpId"
-                  class="weak-item"
-                  type="button"
-                  @click="openWeakPoint(item)"
+                  class="weak-item-row"
                 >
-                  <div class="weak-item-main">
-                    <span class="weak-title">{{ item.moduleIcon }} {{ item.kpTitle }}</span>
-                    <span class="weak-reason">{{ item.reason }}</span>
-                  </div>
-                  <span class="weak-score">{{ item.quizScore == null ? '—' : item.quizScore + '分' }}</span>
-                </button>
+                  <button
+                    class="weak-item"
+                    type="button"
+                    @click="openWeakPoint(item)"
+                  >
+                    <div class="weak-item-main">
+                      <span class="weak-title">{{ item.moduleIcon }} {{ item.kpTitle }}</span>
+                      <span class="weak-reason">{{ item.reason }}</span>
+                    </div>
+                    <span class="weak-score">{{ item.quizScore == null ? '—' : item.quizScore + '分' }}</span>
+                  </button>
+                  <button
+                    class="weak-resolve"
+                    type="button"
+                    title="标记已复习"
+                    @click="markWeakResolved(item.kpId)"
+                  >
+                    已复习
+                  </button>
+                </div>
               </div>
               <div v-for="mod in project.path.modules" :key="mod.id" class="tree-module">
                 <div class="module-header" @click="toggleModule(mod.id)">
@@ -465,10 +534,41 @@ function handleDetailNext(kpId: string) {
                 </div>
               </div>
 
-              <div v-if="!project.studyPlan" class="plan-empty">
+              <div v-if="planLoading" class="gen-inline-panel" aria-live="polite">
+                <div class="gen-inline-status">
+                  <span class="spinner"></span>
+                  <div>
+                    <strong>{{ store.generateProgress || '正在生成学习计划...' }}</strong>
+                    <p>按每日学时编排任务中，可取消后重试。</p>
+                  </div>
+                </div>
+                <div class="plan-skeleton" aria-hidden="true">
+                  <div v-for="i in 3" :key="'ps-' + i" class="plan-sk-day">
+                    <div class="sk-line sk-title"></div>
+                    <div class="sk-line"></div>
+                    <div class="sk-line sk-short"></div>
+                  </div>
+                </div>
+              </div>
+
+              <div v-else-if="planError" class="error-inline-panel" role="alert">
+                <div class="error-inline-title">{{ planErrorTitle || '计划生成失败' }}</div>
+                <p>{{ planError }}</p>
+                <div class="error-inline-actions">
+                  <button
+                    v-if="planErrorRetryable"
+                    class="btn btn-primary"
+                    type="button"
+                    @click="generatePlan"
+                  >重试</button>
+                  <button class="btn btn-ghost" type="button" @click="dismissPlanError">关闭</button>
+                </div>
+              </div>
+
+              <div v-if="!project.studyPlan && !planLoading" class="plan-empty">
                 <p>选择每日学时后生成可执行学习计划</p>
               </div>
-              <div v-else class="plan-list">
+              <div v-if="project.studyPlan" class="plan-list" :class="{ dimmed: planLoading }">
                 <div v-for="day in project.studyPlan.days" :key="day.dayNumber" class="plan-day">
                   <div class="day-header">
                     <span class="day-number">Day {{ day.dayNumber }}</span>
@@ -556,7 +656,36 @@ function handleDetailNext(kpId: string) {
                 >取消</button>
               </div>
 
-              <div v-if="sortedSummaries.length === 0" class="report-empty">
+              <div v-if="reportLoading" class="gen-inline-panel" aria-live="polite">
+                <div class="gen-inline-status">
+                  <span class="spinner"></span>
+                  <div>
+                    <strong>{{ store.generateProgress || '正在生成今日报告...' }}</strong>
+                    <p>汇总今日学习数据中，可取消后重试。</p>
+                  </div>
+                </div>
+                <div class="report-skeleton" aria-hidden="true">
+                  <div class="sk-line sk-title"></div>
+                  <div class="sk-line"></div>
+                  <div class="sk-line sk-short"></div>
+                </div>
+              </div>
+
+              <div v-else-if="reportError" class="error-inline-panel" role="alert">
+                <div class="error-inline-title">{{ reportErrorTitle || '报告生成失败' }}</div>
+                <p>{{ reportError }}</p>
+                <div class="error-inline-actions">
+                  <button
+                    v-if="reportErrorRetryable"
+                    class="btn btn-primary"
+                    type="button"
+                    @click="generateDailyReport"
+                  >重试</button>
+                  <button class="btn btn-ghost" type="button" @click="dismissReportError">关闭</button>
+                </div>
+              </div>
+
+              <div v-if="sortedSummaries.length === 0 && !reportLoading" class="report-empty">
                 <p>暂无学习报告</p>
                 <p class="report-hint">完成学习或计划任务后，可一键生成今日总结</p>
               </div>
@@ -579,23 +708,24 @@ function handleDetailNext(kpId: string) {
           <div>
             <h2>知识图谱</h2>
             <p class="graph-hint">按模块查看学习路径，点击节点进入详情</p>
-            <div v-if="continueTarget" class="continue-strip">
-              <div class="continue-strip-text">
-                <strong>继续学习</strong>
-                <span>{{ continueTarget.kpTitle }}</span>
-                <em v-if="weakQueue.length">薄弱点 {{ weakQueue.length }} · 今日计划 {{ learningStats?.planDone || 0 }}/{{ learningStats?.planTotal || 0 }}</em>
-              </div>
-              <div class="continue-actions">
-                <button
-                  v-if="weakQueue.length"
-                  class="btn btn-secondary continue-btn"
-                  type="button"
-                  @click="openWeakPoint(weakQueue[0])"
-                >
-                  先复习
-                </button>
-                <button class="btn btn-primary continue-btn" type="button" @click="continueLearningNow">立即学习</button>
-              </div>
+            <TodayLearningCard
+              v-if="todayCard"
+              class="tree-today-card"
+              :card="todayCard"
+              compact
+              cta-label="立即学习"
+              @continue="continueLearningNow"
+              @review="openTodayReview"
+            />
+            <div v-if="weakQueue.length" class="weak-inline">
+              <button
+                class="btn btn-secondary continue-btn"
+                type="button"
+                @click="openWeakPoint(weakQueue[0])"
+              >
+                先复习薄弱点
+              </button>
+              <span class="weak-inline-text">薄弱 {{ weakQueue.length }} · 今日计划 {{ learningStats?.planDone || 0 }}/{{ learningStats?.planTotal || 0 }}</span>
             </div>
           </div>
           <div class="legend">
@@ -1067,6 +1197,23 @@ function handleDetailNext(kpId: string) {
   padding: 8px 10px 10px;
 }
 
+.tree-today-card {
+  margin-top: 12px;
+}
+
+.weak-inline {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.weak-inline-text {
+  font-size: 11px;
+  color: #9eb5d8;
+}
+
 .continue-strip {
   display: flex;
   align-items: center;
@@ -1115,6 +1262,32 @@ function handleDetailNext(kpId: string) {
 .continue-btn {
   flex-shrink: 0;
   white-space: nowrap;
+}
+
+.weak-item-row {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.weak-item-row .weak-item {
+  flex: 1;
+  min-width: 0;
+}
+
+.weak-resolve {
+  flex-shrink: 0;
+  border: 1px solid rgba(142, 180, 255, 0.22);
+  background: rgba(255, 255, 255, 0.04);
+  color: #c9dbff;
+  border-radius: 8px;
+  padding: 0 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.weak-resolve:hover {
+  background: rgba(79, 140, 255, 0.14);
 }
 
 .weak-queue {
@@ -1591,5 +1764,95 @@ function handleDetailNext(kpId: string) {
   .legend {
     justify-content: flex-start;
   }
+}
+
+.gen-inline-panel,
+.error-inline-panel {
+  margin: 12px 0;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(79, 140, 255, 0.22);
+  background: rgba(10, 16, 28, 0.55);
+}
+
+.error-inline-panel {
+  border-color: rgba(255, 120, 140, 0.35);
+  background: rgba(42, 16, 24, 0.45);
+}
+
+.gen-inline-status {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  margin-bottom: 10px;
+}
+
+.gen-inline-status strong {
+  display: block;
+  font-size: 12px;
+  color: #e8f0ff;
+  margin-bottom: 3px;
+}
+
+.gen-inline-status p {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.plan-skeleton,
+.report-skeleton {
+  display: grid;
+  gap: 8px;
+}
+
+.plan-sk-day {
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(255,255,255,0.06);
+  background: rgba(255,255,255,0.03);
+}
+
+.sk-line {
+  height: 9px;
+  border-radius: 999px;
+  margin-bottom: 7px;
+  background: linear-gradient(90deg, rgba(255,255,255,0.05), rgba(255,255,255,0.13), rgba(255,255,255,0.05));
+  background-size: 200% 100%;
+  animation: sk-shimmer 1.2s ease-in-out infinite;
+}
+
+.sk-title { width: 36%; height: 11px; }
+.sk-short { width: 55%; }
+
+@keyframes sk-shimmer {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+
+.error-inline-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: #ffb4be;
+  margin-bottom: 6px;
+}
+
+.error-inline-panel p {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: #ffd0d6;
+  line-height: 1.5;
+}
+
+.error-inline-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.plan-list.dimmed {
+  opacity: 0.55;
+  pointer-events: none;
 }
 </style>

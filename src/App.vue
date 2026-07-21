@@ -10,6 +10,7 @@ const links = [
   { name: 'home', label: '首页', path: '/' },
   { name: 'projects', label: '项目', path: '/projects' },
   { name: 'companion', label: '陪伴', path: '/companion' },
+  { name: 'settings', label: '设置', path: '/settings' },
 ]
 
 const activeName = computed(() => {

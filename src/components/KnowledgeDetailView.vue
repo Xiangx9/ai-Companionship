@@ -3,6 +3,15 @@
 import { ref, watch, computed } from 'vue'
 import { useLearningStore } from '@/store/learning'
 import { toastError, toastSuccess, toastWarning } from '@/utils/toast'
+import { describeAiError } from '@/utils/aiError'
+import {
+  createProgressSignals,
+  progressPercent,
+  progressStatusColor,
+  progressStatusLabel,
+  progressUpgradeHint,
+  recommendNextStep,
+} from '@/utils/progressState'
 import type {
   KnowledgePoint,
   LearningProgress,
@@ -24,9 +33,20 @@ const props = defineProps<Props>()
 const emit = defineEmits<{ close: []; next: [kpId: string] }>()
 const store = useLearningStore()
 
+const isWrongForCurrent = computed(() => {
+  const list = store.getWrongAnswerQueue()
+  return list.some((w) => w.kpId === props.kp.id)
+})
+
+function markCurrentReviewed() {
+  store.resolveWrongAnswer(props.kp.id)
+}
+
 const activeTab = ref<'explain' | 'doc' | 'video' | 'exercise' | 'test' | 'note' | 'diagram'>('explain')
 const chatMessages = ref<TeachingMessage[]>([])
 const chatBusy = ref(false)
+const chatAbort = ref<AbortController | null>(null)
+const streamingMsgId = ref<string | null>(null)
 const docMarkdown = ref('')
 const docHtml = computed(() => (docMarkdown.value ? renderMarkdown(docMarkdown.value) : ''))
 const showDocLoading = ref(false)
@@ -47,6 +67,11 @@ const testGrading = ref(false)
 const testAnswers = ref<Record<string, string>>({})
 const testResults = ref<TestResult | null>(null)
 const testSubmitted = ref(false)
+const docError = ref('')
+const exerciseError = ref('')
+const testError = ref('')
+const diagramError = ref('')
+const chatStatus = ref('')
 
 function restoreSessionForKp(kpId: string) {
   chatMessages.value = store.getTeachingMessages(kpId)
@@ -70,6 +95,11 @@ function restoreSessionForKp(kpId: string) {
   testAnswers.value = {}
   testResults.value = null
   testSubmitted.value = false
+  docError.value = ''
+  exerciseError.value = ''
+  testError.value = ''
+  diagramError.value = ''
+  chatStatus.value = ''
 }
 
 restoreSessionForKp(props.kp.id)
@@ -101,8 +131,8 @@ watch(
 
 const tabs = [
   { key: 'explain' as const, label: 'AI 讲解', icon: '🤖' },
-  { key: 'doc' as const, label: '学习文档', icon: '📄' },
   { key: 'video' as const, label: '推荐视频', icon: '🎬' },
+  { key: 'doc' as const, label: '学习文档', icon: '📄' },
   { key: 'exercise' as const, label: '练习', icon: '💪' },
   { key: 'test' as const, label: '测试', icon: '📋' },
   { key: 'diagram' as const, label: '图表', icon: '📊' },
@@ -110,24 +140,58 @@ const tabs = [
 ]
 
 function getStatusColor(status?: string) {
-  if (status === 'completed' || status === 'mastered') return '#22c3a6'
-  if (status === 'in_progress') return '#f0b429'
-  return '#7b8aa3'
+  return progressStatusColor(status)
 }
 
 function getStatusLabel(status?: string) {
-  if (status === 'completed' || status === 'mastered') return '已掌握'
-  if (status === 'in_progress') return '学习中'
-  return '未开始'
+  return progressStatusLabel(status)
+}
+
+const progressSignals = computed(() =>
+  createProgressSignals({
+    status: props.progress?.status ?? 'not_started',
+    teachInteractions: props.progress?.teachInteractions ?? 0,
+    practicePassCount: props.progress?.practicePassCount ?? 0,
+    practiceAttempts: props.progress?.practiceAttempts ?? 0,
+    quizScore: props.progress?.quizScore,
+    startedAt: props.progress?.startedAt,
+    completedAt: props.progress?.completedAt,
+  }),
+)
+
+const masteryPercent = computed(() => progressPercent(progressSignals.value))
+
+const upgradeHint = computed(() => progressUpgradeHint(progressSignals.value))
+
+const nextStep = computed(() =>
+  recommendNextStep({
+    status: progressSignals.value.status,
+    teachInteractions: progressSignals.value.teachInteractions,
+    practicePassCount: progressSignals.value.practicePassCount,
+    quizScore: progressSignals.value.quizScore,
+    hasTeacherMessage: chatMessages.value.some((m) => m.role === 'teacher'),
+  }),
+)
+
+function goRecommendedStep() {
+  const step = nextStep.value
+  activeTab.value = step.tab as typeof activeTab.value
+  if (step.action === 'explain' && chatMessages.value.length === 0 && !chatBusy.value) {
+    void startTeachingSession(false)
+  }
 }
 
 async function loadDoc() {
-  if (docMarkdown.value) return
+  if (docMarkdown.value && !docError.value) return
   showDocLoading.value = true
+  docError.value = ''
   try {
     docMarkdown.value = await store.generateDocForKP(props.kp.id)
-  } catch {
-    docMarkdown.value = '## 文档生成失败\n\n请稍后重试。'
+  } catch (e) {
+    const info = describeAiError(e)
+    docError.value = info.message
+    docMarkdown.value = ''
+    toastError(info.message)
   } finally {
     showDocLoading.value = false
   }
@@ -137,47 +201,126 @@ function updateProgress(status: LearningProgress['status']) {
   store.updateKnowledgePointProgress(props.kp.id, status)
 }
 
-async function handleChatSend(answer: string) {
+
+function upsertChatMessage(msg: TeachingMessage) {
+  const list = chatMessages.value
+  const idx = list.findIndex((m) => m.id === msg.id)
+  if (idx >= 0) {
+    const next = list.slice()
+    next[idx] = { ...msg }
+    chatMessages.value = next
+  } else {
+    chatMessages.value = [...list, { ...msg }]
+  }
+  streamingMsgId.value = msg.id
+}
+
+function cancelTeachingStream() {
+  chatAbort.value?.abort()
+}
+
+async function handleChatSend(
+  payload: string | { text: string; display?: string; kind?: 'answer' | 'directive' },
+) {
   if (chatBusy.value) return
+  const text = typeof payload === 'string' ? payload : payload.text
+  const display = typeof payload === 'string' ? undefined : payload.display
+  const kind = typeof payload === 'string' ? 'answer' : (payload.kind || 'answer')
+  if (!text.trim()) return
+
+  chatAbort.value?.abort()
+  const controller = new AbortController()
+  chatAbort.value = controller
   chatBusy.value = true
+  chatStatus.value = kind === 'directive' ? '正在流式讲解…' : 'AI 正在回复，请稍候…'
+  // Optimistic student bubble so the send feels instant
+  chatMessages.value = [
+    ...chatMessages.value,
+    {
+      id: 'local-student-' + Date.now(),
+      role: 'student',
+      content: text.trim(),
+      displayContent: display,
+      type: 'text',
+      timestamp: new Date().toISOString(),
+    },
+  ]
   try {
-    const session = await store.submitAnswer(props.kp.id, answer)
+    const session = await store.submitAnswer(props.kp.id, text.trim(), {
+      displayContent: display,
+      kind,
+      signal: controller.signal,
+      onDelta: (msg) => upsertChatMessage(msg),
+    })
     chatMessages.value = session?.messages ? [...session.messages] : store.getTeachingMessages(props.kp.id)
   } catch (e) {
+    const info = describeAiError(e)
+    if (info.code === 'aborted' || /取消|中断/.test(info.message)) {
+      chatMessages.value = store.getTeachingMessages(props.kp.id)
+      chatStatus.value = ''
+      return
+    }
+    const hint = info.retryable ? '\n\n可点击下方「继续教学」或重新发送以重试。' : ''
     chatMessages.value = [
       ...chatMessages.value,
       {
         id: 'err-' + Date.now(),
         role: 'teacher',
-        content: e instanceof Error ? e.message : '发送失败，请重试',
+        content: info.message + hint,
         type: 'feedback',
         timestamp: new Date().toISOString(),
       },
     ]
+    toastError(info.message)
   } finally {
+    if (chatAbort.value === controller) chatAbort.value = null
+    streamingMsgId.value = null
     chatBusy.value = false
+    chatStatus.value = ''
   }
 }
 
 async function startTeachingSession(forceNew = false) {
   if (chatBusy.value) return
+  chatAbort.value?.abort()
+  const controller = new AbortController()
+  chatAbort.value = controller
   chatBusy.value = true
+  chatStatus.value = forceNew ? '正在重新开课（流式）…' : '正在流式讲解…'
+  if (forceNew) {
+    chatMessages.value = []
+    streamingMsgId.value = null
+  }
   try {
-    await store.startTeaching(props.kp.id, { forceNew })
+    await store.startTeaching(props.kp.id, {
+      forceNew,
+      signal: controller.signal,
+      onDelta: (msg) => upsertChatMessage(msg),
+    })
     chatMessages.value = store.getTeachingMessages(props.kp.id)
   } catch (e) {
+    const info = describeAiError(e)
+    if (info.code === 'aborted' || /取消|中断/.test(info.message)) {
+      chatMessages.value = store.getTeachingMessages(props.kp.id)
+      return
+    }
+    const hint = info.retryable ? '\n\n可点击「开始 AI 教学」重试。' : ''
     chatMessages.value = [
-      ...chatMessages.value,
+      ...store.getTeachingMessages(props.kp.id),
       {
         id: 'err-' + Date.now(),
         role: 'teacher',
-        content: e instanceof Error ? `教学启动失败：${e.message}` : '教学启动失败，请重试',
+        content: (info.title === '生成失败' ? '教学启动失败：' : info.title + '：') + info.message + hint,
         type: 'text',
         timestamp: new Date().toISOString(),
       },
     ]
+    toastError(info.message)
   } finally {
+    if (chatAbort.value === controller) chatAbort.value = null
+    streamingMsgId.value = null
     chatBusy.value = false
+    chatStatus.value = ''
   }
 }
 
@@ -202,16 +345,20 @@ async function renderDiagramSvgs() {
 }
 
 async function loadDiagrams() {
-  if (diagrams.value.length && mermaidHtml.value.length) return
+  if (diagrams.value.length && mermaidHtml.value.length && !diagramError.value) return
   diagramLoading.value = true
+  diagramError.value = ''
   try {
     if (!diagrams.value.length) {
       diagrams.value = await store.generateDiagramsForKP(props.kp.id)
     }
     await renderDiagramSvgs()
-  } catch {
+  } catch (e) {
+    const info = describeAiError(e)
     diagrams.value = []
     mermaidHtml.value = []
+    diagramError.value = info.message
+    toastError(info.message)
   } finally {
     diagramLoading.value = false
   }
@@ -222,11 +369,14 @@ async function generateExercises() {
   exercises.value = []
   exerciseAnswers.value = {}
   exerciseGrades.value = new Map()
+  exerciseError.value = ''
   try {
     exercises.value = await store.generateExercisesForKP(props.kp.id, 5)
-  } catch {
+  } catch (e) {
+    const info = describeAiError(e)
     exercises.value = []
-    toastError('练习题生成失败，请重试')
+    exerciseError.value = info.message
+    toastError(info.message)
   } finally {
     exerciseLoading.value = false
   }
@@ -241,8 +391,15 @@ async function gradeSingleExercise(exercise: Exercise) {
   try {
     const result = await store.gradeExercise(exercise, answer)
     exerciseGrades.value.set(exercise.id, result)
-  } catch {
-    toastError('评分失败，请重试')
+    const applied = store.recordPracticeResult(props.kp.id, result.score, exercise.score || 1)
+    if (applied?.status === 'completed') {
+      toastSuccess('练习达标：进度已更新为「已完成」')
+    } else if (result.isCorrect || (exercise.score > 0 && result.score / exercise.score >= 0.6)) {
+      toastSuccess('本题达标，继续加油')
+    }
+  } catch (e) {
+    const info = describeAiError(e)
+    toastError(info.message)
   }
 }
 
@@ -263,11 +420,14 @@ async function generateTest() {
   testAnswers.value = {}
   testResults.value = null
   testSubmitted.value = false
+  testError.value = ''
   try {
     testExercises.value = await store.generateExercisesForKP(props.kp.id, 10)
-  } catch {
+  } catch (e) {
+    const info = describeAiError(e)
     testExercises.value = []
-    toastError('测试题生成失败，请重试')
+    testError.value = info.message
+    toastError(info.message)
   } finally {
     testLoading.value = false
   }
@@ -413,14 +573,16 @@ function statusHint(status?: string) {
         <span class="progress-value" :style="{ color: getStatusColor(progress?.status) }">{{ getStatusLabel(progress?.status) }}</span>
       </div>
       <ProgressBar
-        :percent="progress?.status === 'completed' || progress?.status === 'mastered' ? 100 : progress?.status === 'in_progress' ? 50 : 0"
+        :percent="masteryPercent"
         size="sm"
         :show-label="false"
       />
+      <p class="upgrade-hint">{{ upgradeHint }}</p>
       <div class="progress-buttons">
         <button class="p-btn" type="button" :class="{ active: progress?.status === 'not_started' }" @click="updateProgress('not_started')">未开始</button>
         <button class="p-btn" type="button" :class="{ active: progress?.status === 'in_progress' }" @click="updateProgress('in_progress')">学习中</button>
-        <button class="p-btn completed" type="button" :class="{ active: progress?.status === 'completed' || progress?.status === 'mastered' }" @click="updateProgress('completed')">已完成</button>
+        <button class="p-btn completed" type="button" :class="{ active: progress?.status === 'completed' }" @click="updateProgress('completed')">已完成</button>
+        <button class="p-btn mastered" type="button" :class="{ active: progress?.status === 'mastered' }" @click="updateProgress('mastered')">已掌握</button>
       </div>
       <div class="finish-actions">
         <button
@@ -447,6 +609,30 @@ function statusHint(status?: string) {
       </div>
     </div>
 
+    <div class="next-step-bar">
+      <div class="next-step-copy">
+        <span class="next-step-kicker">当前建议</span>
+        <strong class="next-step-title">{{ nextStep.title }}</strong>
+        <span class="next-step-detail">{{ nextStep.detail }}</span>
+      </div>
+      <button
+        class="btn btn-primary next-step-cta"
+        type="button"
+        :disabled="chatBusy && nextStep.action === 'explain'"
+        @click="goRecommendedStep"
+      >
+        {{ nextStep.cta }}
+      </button>
+    </div>
+
+    <div v-if="isWrongForCurrent" class="wrong-banner">
+      <div class="wrong-banner-text">
+        <strong>错题回流</strong>
+        <span>该知识点仍在弱项列表，建议重学讲解或再测一次</span>
+      </div>
+      <button class="btn btn-secondary" type="button" @click="markCurrentReviewed">标记已复习</button>
+    </div>
+
     <div class="tab-bar">
       <button
         v-for="tab in tabs"
@@ -463,10 +649,25 @@ function statusHint(status?: string) {
 
     <div class="tab-content">
       <div v-if="activeTab === 'explain'" class="tab-pane explain-pane">
-        <AiChat :messages="chatMessages" :kp-title="kp.title" :disabled="chatBusy" class="chat-container" @send="handleChatSend" />
+        <AiChat
+          :messages="chatMessages"
+          :kp-title="kp.title"
+          :disabled="chatBusy"
+          :status-text="chatStatus"
+          :streaming-id="streamingMsgId"
+          class="chat-container"
+          @send="handleChatSend"
+          @cancel="cancelTeachingStream"
+        />
         <div class="teach-actions">
+          <button
+            v-if="chatBusy"
+            class="btn btn-ghost"
+            type="button"
+            @click="cancelTeachingStream"
+          >停止生成</button>
           <button class="btn btn-primary" type="button" :disabled="chatBusy" @click="startTeachingSession(false)">
-            {{ chatBusy ? '思考中...' : (chatMessages.length ? '继续教学' : '开始 AI 教学') }}
+            {{ chatBusy ? '讲解中...' : (chatMessages.length ? '继续教学' : '开始 AI 教学') }}
           </button>
           <button
             v-if="chatMessages.length"
@@ -481,11 +682,18 @@ function statusHint(status?: string) {
       </div>
 
       <div v-if="activeTab === 'doc'" class="tab-pane">
-        <div v-if="!docMarkdown && !showDocLoading" class="empty-state">
+        <div v-if="!docMarkdown && !showDocLoading && !docError" class="empty-state">
           <p>AI 会根据当前知识点生成结构化学习文档</p>
           <button class="btn btn-secondary" type="button" @click="loadDoc">生成文档</button>
         </div>
-        <div v-else-if="showDocLoading" class="empty-state"><p>正在生成文档...</p></div>
+        <div v-else-if="showDocLoading" class="empty-state loading-state">
+          <span class="spinner"></span>
+          <p>正在生成文档，通常需要十几秒…</p>
+        </div>
+        <div v-else-if="docError" class="empty-state error-state">
+          <p>{{ docError }}</p>
+          <button class="btn btn-primary" type="button" @click="loadDoc">重试</button>
+        </div>
         <div v-else class="doc-content" v-html="docHtml"></div>
       </div>
 
@@ -509,13 +717,20 @@ function statusHint(status?: string) {
       </div>
 
       <div v-if="activeTab === 'exercise'" class="tab-pane">
-        <div v-if="!exercises.length && !exerciseLoading" class="empty-state">
+        <div v-if="!exercises.length && !exerciseLoading && !exerciseError" class="empty-state">
           <p>生成练习题，巩固当前知识点</p>
           <button class="btn btn-secondary" type="button" :disabled="exerciseLoading" @click="generateExercises">
             {{ exerciseLoading ? '生成中...' : '生成练习题' }}
           </button>
         </div>
-        <div v-else-if="exerciseLoading" class="empty-state"><p>正在生成练习题...</p></div>
+        <div v-else-if="exerciseLoading" class="empty-state loading-state">
+          <span class="spinner"></span>
+          <p>正在生成练习题，请稍候…</p>
+        </div>
+        <div v-else-if="exerciseError" class="empty-state error-state">
+          <p>{{ exerciseError }}</p>
+          <button class="btn btn-primary" type="button" @click="generateExercises">重试</button>
+        </div>
         <div v-else class="card-list">
           <div v-for="(ex, idx) in exercises" :key="ex.id" class="content-card">
             <div class="card-head">
@@ -556,13 +771,20 @@ function statusHint(status?: string) {
       </div>
 
       <div v-if="activeTab === 'test'" class="tab-pane">
-        <div v-if="!testExercises.length && !testLoading && !testSubmitted" class="empty-state">
+        <div v-if="!testExercises.length && !testLoading && !testSubmitted && !testError" class="empty-state">
           <p>生成一组题目做自测，检验学习成果</p>
           <button class="btn btn-secondary" type="button" :disabled="testLoading" @click="generateTest">
             {{ testLoading ? '生成中...' : '生成测试题' }}
           </button>
         </div>
-        <div v-else-if="testLoading" class="empty-state"><p>正在生成测试题目...</p></div>
+        <div v-else-if="testLoading" class="empty-state loading-state">
+          <span class="spinner"></span>
+          <p>正在生成测试题目，请稍候…</p>
+        </div>
+        <div v-else-if="testError" class="empty-state error-state">
+          <p>{{ testError }}</p>
+          <button class="btn btn-primary" type="button" @click="generateTest">重试</button>
+        </div>
         <div v-else-if="testResults" class="card-list">
           <div class="summary-card">
             <div class="score-big" :style="{ color: getTestGradeColor(testResults.totalScore, testResults.maxScore) }">
@@ -673,13 +895,20 @@ function statusHint(status?: string) {
       </div>
 
       <div v-if="activeTab === 'diagram'" class="tab-pane">
-        <div v-if="!diagrams.length && !diagramLoading" class="empty-state">
+        <div v-if="!diagrams.length && !diagramLoading && !diagramError" class="empty-state">
           <p>生成思维导图和流程图，帮助理解结构</p>
           <button class="btn btn-secondary" type="button" :disabled="diagramLoading" @click="loadDiagrams">
             {{ diagramLoading ? '生成中...' : '生成图表' }}
           </button>
         </div>
-        <div v-else-if="diagramLoading" class="empty-state"><p>正在生成图表...</p></div>
+        <div v-else-if="diagramLoading" class="empty-state loading-state">
+          <span class="spinner"></span>
+          <p>正在生成图表，请稍候…</p>
+        </div>
+        <div v-else-if="diagramError" class="empty-state error-state">
+          <p>{{ diagramError }}</p>
+          <button class="btn btn-primary" type="button" @click="loadDiagrams">重试</button>
+        </div>
         <div v-else class="card-list">
           <div v-for="(diag, idx) in diagrams" :key="idx" class="content-card">
             <h4>{{ diag.caption }}</h4>
@@ -893,6 +1122,11 @@ function statusHint(status?: string) {
   background: rgba(79,140,255,0.14);
 }
 
+.p-btn.mastered.active {
+  color: #b8fff0;
+  border-color: rgba(34,195,166,0.45);
+  background: rgba(34,195,166,0.14);
+}
 .p-btn.completed.active {
   color: #b8fff0;
   border-color: rgba(34,195,166,0.4);
@@ -1286,6 +1520,124 @@ function statusHint(status?: string) {
   }
   .chat-container {
     min-height: 260px;
+  }
+}
+
+.upgrade-hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.next-step-bar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  background:
+    linear-gradient(135deg, rgba(79,140,255,0.12), rgba(34,195,166,0.08)),
+    rgba(10, 14, 24, 0.96);
+  backdrop-filter: blur(8px);
+}
+
+.next-step-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.next-step-kicker {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: #9ec0ff;
+  text-transform: none;
+}
+
+.next-step-title {
+  font-size: 14px;
+  color: #f2f6ff;
+  font-weight: 700;
+}
+
+.next-step-detail {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.next-step-cta {
+  flex-shrink: 0;
+  min-height: 38px;
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  .next-step-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .next-step-cta {
+    width: 100%;
+  }
+}
+
+.loading-state,
+.error-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  text-align: center;
+}
+
+.loading-state p,
+.error-state p {
+  margin: 0;
+  color: var(--text-muted);
+  line-height: 1.5;
+  max-width: 36ch;
+}
+
+.error-state p {
+  color: #ffb4be;
+}
+
+.wrong-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 93, 108, 0.28);
+  background: rgba(255, 93, 108, 0.1);
+}
+.wrong-banner-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.wrong-banner-text strong {
+  font-size: 12px;
+  color: #ffc2c9;
+}
+.wrong-banner-text span {
+  font-size: 12px;
+  color: #e8c4c8;
+}
+@media (max-width: 640px) {
+  .wrong-banner {
+    flex-direction: column;
+    align-items: stretch;
   }
 }
 </style>
