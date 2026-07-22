@@ -151,14 +151,19 @@ function getDefaultModel(): string {
 
 function bindAbortPair(signal?: AbortSignal, timeoutMs = 180000) {
   const controller = new AbortController()
+  let timedOut = false
   const onExternalAbort = () => controller.abort()
   if (signal) {
     if (signal.aborted) controller.abort()
     else signal.addEventListener('abort', onExternalAbort, { once: true })
   }
-  const timer = window.setTimeout(() => controller.abort(), timeoutMs)
+  const timer = window.setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, timeoutMs)
   return {
     controller,
+    didTimeout: () => timedOut,
     cleanup() {
       window.clearTimeout(timer)
       if (signal) signal.removeEventListener('abort', onExternalAbort)
@@ -166,12 +171,18 @@ function bindAbortPair(signal?: AbortSignal, timeoutMs = 180000) {
   }
 }
 
-function throwIfAborted(signal?: AbortSignal): never {
-  if (signal?.aborted) throw new AiRequestError('AI 请求已取消', 'aborted')
+function throwAbortError(kind: 'timeout' | 'aborted' = 'timeout'): never {
+  if (kind === 'aborted') throw new AiRequestError('AI 请求已取消', 'aborted')
   throw new AiRequestError('AI 请求超时，请稍后重试', 'timeout')
 }
 
-/** Extract delta text from an OpenAI-compatible SSE JSON payload. */
+function throwIfAborted(signal?: AbortSignal, timedOut = false): never {
+  if (timedOut) throwAbortError('timeout')
+  if (signal?.aborted) throwAbortError('aborted')
+  throwAbortError('timeout')
+}
+
+/** Extract assistant content delta from an OpenAI-compatible SSE JSON payload. */
 export function extractStreamDelta(data: unknown): string {
   if (!data || typeof data !== 'object') return ''
   const root = data as Record<string, unknown>
@@ -185,13 +196,39 @@ export function extractStreamDelta(data: unknown): string {
   return asTextCandidate(message.content ?? first.text)
 }
 
+/** Extract reasoning/thinking delta (Agnes 2.0 etc.). */
+export function extractStreamReasoningDelta(data: unknown): string {
+  if (!data || typeof data !== 'object') return ''
+  const root = data as Record<string, unknown>
+  const choices = Array.isArray(root.choices) ? root.choices : []
+  const first = choices[0] && typeof choices[0] === 'object' ? (choices[0] as Record<string, unknown>) : {}
+  const delta = first.delta && typeof first.delta === 'object' ? (first.delta as Record<string, unknown>) : {}
+  const fromDelta = asTextCandidate(
+    delta.reasoning_content ?? delta.reasoning ?? delta.thinking,
+  )
+  if (fromDelta) return fromDelta
+  const message = first.message && typeof first.message === 'object' ? (first.message as Record<string, unknown>) : {}
+  return asTextCandidate(message.reasoning_content ?? message.reasoning)
+}
+
+/** Prefer final content; only salvage reasoning when it already looks like the answer. */
+function preferContentOrReasoning(content: string, reasoning: string): string {
+  if (content) return content
+  if (reasoning && looksLikeFinalAnswer(reasoning)) return reasoning
+  return content
+}
+
 /** Parse one SSE data line body (without the leading "data: "). */
-export function parseSseDataLine(line: string): { done: boolean; chunk: string } {
+export function parseSseDataLine(line: string): { done: boolean; chunk: string; reasoning?: string } {
   const raw = line.replace(/^data:\s?/, '').trim()
   if (!raw || raw === '[DONE]') return { done: true, chunk: '' }
   try {
     const json = JSON.parse(raw) as unknown
-    return { done: false, chunk: extractStreamDelta(json) }
+    return {
+      done: false,
+      chunk: extractStreamDelta(json),
+      reasoning: extractStreamReasoningDelta(json) || undefined,
+    }
   } catch {
     // plain text fragment
     return { done: false, chunk: raw }
@@ -228,7 +265,6 @@ async function readSseStream(
 ): Promise<string> {
   const body = response.body
   if (!body) {
-    // No body stream — try JSON full response
     const data = await response.json()
     const content = extractAssistantText(data)
     return simulateTextStream(content, onDelta, signal)
@@ -238,11 +274,19 @@ async function readSseStream(
   const decoder = new TextDecoder('utf-8')
   let buffer = ''
   let full = ''
+  let reasoning = ''
   let sawEvent = false
+
+  const appendReasoning = (piece: string) => {
+    if (!piece) return
+    sawEvent = true
+    reasoning += piece
+  }
 
   while (true) {
     if (signal?.aborted) {
       try { await reader.cancel() } catch { /* ignore */ }
+      // chatCompletion reclassifies timeout vs user cancel via didTimeout()
       throw new AiRequestError('AI 请求已取消', 'aborted')
     }
     const { done, value } = await reader.read()
@@ -254,13 +298,12 @@ async function readSseStream(
       const trimmed = line.trim()
       if (!trimmed || trimmed.startsWith(':')) continue
       if (!trimmed.startsWith('data:')) {
-        // Some proxies send raw JSON chunks without SSE framing
         try {
           const json = JSON.parse(trimmed) as unknown
+          appendReasoning(extractStreamReasoningDelta(json))
           const piece = extractStreamDelta(json) || extractAssistantText(json)
           if (piece) {
             sawEvent = true
-            // if full assistant text appears once, treat as full payload chunk
             if (!full && piece.length > 40 && extractAssistantText(json)) {
               full = extractAssistantText(json)
               await simulateTextStream(full, onDelta, signal)
@@ -274,37 +317,46 @@ async function readSseStream(
         }
         continue
       }
-      const { done: isDone, chunk } = parseSseDataLine(trimmed)
-      if (isDone) {
+      const parsed = parseSseDataLine(trimmed)
+      if (parsed.done) {
         sawEvent = true
         continue
       }
-      if (chunk) {
+      if (parsed.reasoning) appendReasoning(parsed.reasoning)
+      if (parsed.chunk) {
         sawEvent = true
-        full += chunk
-        onDelta?.(full, chunk)
+        full += parsed.chunk
+        onDelta?.(full, parsed.chunk)
       }
     }
   }
 
-  // Flush remaining buffer
   if (buffer.trim().startsWith('data:')) {
-    const { done: isDone, chunk } = parseSseDataLine(buffer.trim())
-    if (!isDone && chunk) {
-      full += chunk
-      onDelta?.(full, chunk)
-      sawEvent = true
+    const parsed = parseSseDataLine(buffer.trim())
+    if (!parsed.done) {
+      if (parsed.reasoning) appendReasoning(parsed.reasoning)
+      if (parsed.chunk) {
+        full += parsed.chunk
+        onDelta?.(full, parsed.chunk)
+        sawEvent = true
+      }
     }
   }
 
-  if (!full && !sawEvent) {
-    // Body was not SSE — try re-read is impossible; fall through empty
+  const resolved = preferContentOrReasoning(full, reasoning)
+  if (!resolved && !sawEvent) {
     throw new AiRequestError('AI 流式返回为空，请稍后重试', 'empty')
   }
-  if (!full) {
-    throw new AiRequestError('AI 返回了空内容，请稍后重试', 'empty')
+  if (!resolved) {
+    throw new AiRequestError(
+      'AI 返回了空内容（模型可能把额度花在思考过程上）。请在设置中换更快模型，或稍后重试',
+      'empty',
+    )
   }
-  return full
+  if (!full && resolved) {
+    await simulateTextStream(resolved, onDelta, signal)
+  }
+  return resolved
 }
 
 export async function chatCompletion(
@@ -322,7 +374,9 @@ export async function chatCompletion(
     stream = false,
   } = opts ?? {}
   const apiKey = getApiKey()
-  const { controller, cleanup } = bindAbortPair(signal, timeoutMs)
+  const { controller, cleanup, didTimeout } = bindAbortPair(signal, timeoutMs)
+  // Same controller for fetch + SSE reader so timeout actually stops the stream
+  const activeSignal = controller.signal
 
   try {
     const response = await aiFetch('/chat/completions', {
@@ -339,25 +393,33 @@ export async function chatCompletion(
         max_tokens: maxTokens,
         ...(stream ? { stream: true } : {}),
       }),
-      signal: controller.signal,
+      signal: activeSignal,
     })
     if (!response.ok) {
       const errorText = await response.text()
-      throw new AiRequestError('AI 请求失败 (' + response.status + '): ' + errorText, 'http')
+      const detail = (errorText || '').slice(0, 500)
+      // Gateway returns 503 + model_not_found when the model id has no channel
+      if (/model_not_found|No available channel for model/i.test(detail)) {
+        throw new AiRequestError(
+          'AI 请求失败 (' + response.status + '): ' + detail,
+          'config',
+        )
+      }
+      throw new AiRequestError('AI 请求失败 (' + response.status + '): ' + detail, 'http')
     }
 
     if (stream) {
       const ctype = (response.headers.get('content-type') || '').toLowerCase()
       // True SSE
       if (ctype.includes('text/event-stream') || ctype.includes('event-stream')) {
-        return await readSseStream(response, onDelta, signal ?? controller.signal)
+        return await readSseStream(response, onDelta, activeSignal)
       }
       // Gateway returned full JSON even though stream was requested
       try {
         const data = await response.json()
         const content = extractAssistantText(data)
         if (!content) throw new AiRequestError('AI 返回了空内容，请稍后重试', 'empty')
-        await simulateTextStream(content, onDelta, signal ?? controller.signal)
+        await simulateTextStream(content, onDelta, activeSignal)
         return content
       } catch (err) {
         if (err instanceof AiRequestError) throw err
@@ -371,10 +433,10 @@ export async function chatCompletion(
     if (!content) {
       throw new AiRequestError('AI 返回了空内容，请稍后重试', 'empty')
     }
-    if (onDelta) await simulateTextStream(content, onDelta, signal ?? controller.signal)
+    if (onDelta) await simulateTextStream(content, onDelta, activeSignal)
     return content
   } catch (err) {
-    if (controller.signal.aborted) throwIfAborted(signal)
+    if (activeSignal.aborted) throwIfAborted(signal, didTimeout())
     throw err
   } finally {
     cleanup()
@@ -656,24 +718,29 @@ export async function generateLearningPath(
     '\n请按规模约束输出紧凑 JSON 学习路径（短字段、少废话）。'
 
   return withRetry(async (attempt) => {
-    const systemPrompt = systemPromptBase + (attempt > 0
-      ? '\n\n【重要】上一次输出无法解析或超时。请输出更短的合法 JSON：4 模块×3 知识点×1 资源，字段极简。'
-      : '')
+    // attempt 0: full 4x3 schema; attempt 1+: compact 3x2 to leave room after reasoning tokens
+    const compact = attempt > 0
+    const systemPrompt =
+      systemPromptBase +
+      '\n\n【硬性】最终答案必须是纯 JSON，写在 content 正文里；不要只在思考过程里写 JSON；不要 markdown。' +
+      (compact
+        ? '\n【重试】上一次失败。请输出更短合法 JSON：恰好 3 个模块，每模块 2 个知识点，每知识点 1 个资源，字段极简。'
+        : '')
     const result = await chatCompletion([
       { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
+      { role: 'user', content: userPrompt + (compact ? '\n请输出极简 JSON，尽快结束。' : '') },
     ], {
       model: getDefaultModel(),
-      temperature: 0.25,
-      // Compact roadmap fits well under 4k; streaming reduces Cloudflare 524 TTFB risk
-      maxTokens: 4096,
-      timeoutMs: 120000,
+      temperature: 0.2,
+      // Agnes 2.0 spends many tokens on reasoning_content before JSON content
+      maxTokens: compact ? 6144 : 8192,
+      timeoutMs: 240000,
       stream: true,
       signal: opts?.signal,
     })
     const raw = parseAndValidateAiJson(result, isLearningPathLike, '学习路径')
     return normalizeLearningPath(raw)
-  }, { retries: 2, label: '生成学习路径', backoffMs: 1000 })
+  }, { retries: 1, label: '生成学习路径', backoffMs: 1200 })
 }
 
 // ==================== 2. 学习计划生成 ====================

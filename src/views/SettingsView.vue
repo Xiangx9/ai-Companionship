@@ -3,7 +3,7 @@
 import { onMounted, ref, computed, watch, nextTick } from 'vue'
 import { useSettingsStore } from '@/store/settings'
 import { toastError, toastSuccess, toastWarning } from '@/utils/toast'
-import { maskApiKey, DEFAULT_AI_MODEL, normalizeBaseUrl } from '@/services/aiConfig'
+import { maskApiKey, DEFAULT_AI_MODEL, normalizeBaseUrl, inheritsEnvBase, originOfBaseUrl } from '@/services/aiConfig'
 
 const store = useSettingsStore()
 const showKey = ref(false)
@@ -15,6 +15,7 @@ const snapshot = ref({ baseUrl: '', apiKey: '', model: '' })
 const lastOkAt = ref('')
 const apiKeyInput = ref<HTMLInputElement | null>(null)
 const baseUrlInput = ref<HTMLInputElement | null>(null)
+const lastNormalizedBase = ref('')
 
 type PresetId = 'env' | 'agnes' | 'hetaosu' | 'custom'
 const presets: { id: PresetId; label: string; hint: string; baseUrl?: string }[] = [
@@ -34,9 +35,10 @@ const activePreset = computed<PresetId>(() => {
 
 const modelOptions = computed(() => {
   const set = new Set<string>()
+  // Only list models from the current gateway + the selected model.
+  // Do not force-inject DEFAULT_AI_MODEL from another provider.
   for (const m of store.availableModels) if (m) set.add(m)
   if (store.model) set.add(store.model)
-  if (DEFAULT_AI_MODEL) set.add(DEFAULT_AI_MODEL)
   return Array.from(set)
 })
 
@@ -44,6 +46,21 @@ const filteredModels = computed(() => {
   const q = modelFilter.value.trim().toLowerCase()
   if (!q) return modelOptions.value
   return modelOptions.value.filter((m) => m.toLowerCase().includes(q))
+})
+
+const modelsSourceHost = computed(() => {
+  const base = store.modelsBaseUrl || ''
+  if (!base) return ''
+  try {
+    return new URL(base).host
+  } catch {
+    return base
+  }
+})
+
+const modelsMatchCurrent = computed(() => {
+  if (!store.modelsBaseUrl) return false
+  return normalizeBaseUrl(store.modelsBaseUrl) === normalizeBaseUrl(store.effective.baseUrl)
 })
 
 const dirty = computed(() => {
@@ -66,7 +83,13 @@ const status = computed(() => {
     return { tone: 'bad' as const, title: '连接失败', desc: shortError(store.lastError) }
   }
   if (!store.hasKey) {
-    return { tone: 'warn' as const, title: '还差一步', desc: '填入 API 密钥后即可测试连接' }
+    return {
+      tone: 'warn' as const,
+      title: '还差一步',
+      desc: store.usingEnvBase
+        ? '填入 API 密钥后即可测试连接'
+        : '当前服务需要单独的 API 密钥（不会自动沿用其他网关的密钥）',
+    }
   }
   if (store.lastMessage || lastOkAt.value) {
     return {
@@ -83,14 +106,19 @@ const status = computed(() => {
 })
 
 const keyStatusText = computed(() => {
-  if (store.apiKey.trim()) return '本机已保存 · ' + maskApiKey(store.apiKey)
+  if (store.apiKey.trim()) return '本机已填写 · ' + maskApiKey(store.apiKey)
   if (store.usingEnvKey) return '继承环境变量 · ' + maskApiKey(store.envDefaults.apiKey)
+  if (store.envDefaults.apiKey && !inheritsEnvBase(store.baseUrl, store.envDefaults.baseUrl)) {
+    return '当前地址与默认不同，需填写该服务商自己的密钥'
+  }
   return '尚未配置密钥'
 })
 
 function shortError(msg: string) {
   const m = msg.trim()
-  if (/INVALID_API_KEY|Invalid API key/i.test(m)) return 'API 密钥无效，请检查后重试'
+  if (/INVALID_API_KEY|Invalid API key|无效的令牌|令牌/i.test(m)) {
+    return 'API 密钥无效或属于其他服务商，请填写当前地址对应的密钥'
+  }
   if (/API_KEY_REQUIRED|API key is required/i.test(m)) return '该服务需要有效的 API 密钥'
   if (/Failed to fetch|NetworkError|network|CORS|跨域/i.test(m)) {
     return '网络或跨域受限：请用 npm run dev 本地运行（已启用代理）'
@@ -121,6 +149,7 @@ function markOkNow() {
 onMounted(() => {
   store.init()
   manualModel.value = store.model
+  lastNormalizedBase.value = normalizeBaseUrl(store.baseUrl || store.effective.baseUrl || '')
   captureSnapshot()
   try {
     lastOkAt.value = localStorage.getItem('aios_ai_last_ok_at') || ''
@@ -132,9 +161,11 @@ onMounted(() => {
 watch(
   () => store.model,
   (v) => {
-    if (v && !manualModel.value) manualModel.value = v
+    // Keep manual input in sync when list refresh picks a preferred model
+    if (v) manualModel.value = v
   },
 )
+
 
 async function focusKey() {
   await nextTick()
@@ -143,34 +174,93 @@ async function focusKey() {
 }
 
 async function applyPreset(id: PresetId) {
+  lastOkAt.value = ''
+  try { localStorage.removeItem('aios_ai_last_ok_at') } catch { /* ignore */ }
+
   if (id === 'env') {
-    store.baseUrl = ''
-    toastSuccess('已切换为环境默认地址')
+    const result = store.applyConnectionPreset({ kind: 'env', preferredModel: DEFAULT_AI_MODEL })
+    manualModel.value = store.model
+    lastNormalizedBase.value = normalizeBaseUrl(store.baseUrl || store.effective.baseUrl || '')
+    // Do not captureSnapshot: leave dirty until user tests/saves
+    toastSuccess(
+      result.needsKey
+        ? '已切换为环境默认地址，请确认密钥'
+        : '已切换为环境默认地址',
+    )
+    if (result.needsKey) await focusKey()
     return
   }
+
   if (id === 'custom') {
-    if (!store.baseUrl.trim()) store.baseUrl = store.envDefaults.baseUrl
-    toastWarning('可直接编辑下方服务地址')
+    store.applyConnectionPreset({ kind: 'custom' })
+    manualModel.value = store.model
+    lastNormalizedBase.value = normalizeBaseUrl(store.baseUrl || store.effective.baseUrl || '')
+    toastWarning('请填写自定义服务地址与对应密钥')
     await nextTick()
     baseUrlInput.value?.focus()
     return
   }
+
   const p = presets.find((x) => x.id === id)
-  if (p?.baseUrl) {
-    store.baseUrl = p.baseUrl
+  if (!p?.baseUrl) return
+  const result = store.applyConnectionPreset({
+    kind: 'named',
+    baseUrl: p.baseUrl,
+    preferredModel: id === 'agnes' ? DEFAULT_AI_MODEL : undefined,
+  })
+  manualModel.value = store.model
+  lastNormalizedBase.value = normalizeBaseUrl(store.baseUrl || store.effective.baseUrl || '')
+  if (result.keyCleared || result.needsKey) {
+    toastWarning('已切换到 ' + p.label + '，请填写该服务商自己的 API 密钥后再刷新模型')
+    await focusKey()
+  } else {
     toastSuccess('已切换到 ' + p.label)
-    if (!store.apiKey.trim() && !store.usingEnvKey) await focusKey()
   }
 }
 
 function onBlurBaseUrl() {
   const raw = store.baseUrl.trim()
-  if (!raw) return
+  if (!raw) {
+    if (lastNormalizedBase.value) {
+      store.clearConnectionState({ clearModels: true })
+      lastOkAt.value = ''
+      try { localStorage.removeItem('aios_ai_last_ok_at') } catch { /* ignore */ }
+    }
+    lastNormalizedBase.value = ''
+    return
+  }
   let next = raw
   if (!/^https?:\/\//i.test(next)) next = 'https://' + next
   next = normalizeBaseUrl(next)
   if (/^https?:\/\/[^/]+$/i.test(next)) next = next + '/v1'
+  const prev = lastNormalizedBase.value || normalizeBaseUrl(store.baseUrl)
+  const prevOrigin = originOfBaseUrl(prev)
+  const nextOrigin = originOfBaseUrl(next)
+  const hostChanged = Boolean(prevOrigin && nextOrigin && prevOrigin !== nextOrigin)
   store.baseUrl = next
+  lastNormalizedBase.value = next
+  if (prev && prev !== next) {
+    store.clearConnectionState({ clearModels: true })
+    // Different gateway host: do not reuse the previous provider's key/models.
+    if (hostChanged) {
+      store.apiKey = ''
+    }
+    // Address host changed: drop previous gateway model id
+    if (!inheritsEnvBase(next, store.envDefaults.baseUrl)) {
+      store.model = ''
+      manualModel.value = ''
+    } else {
+      store.model = DEFAULT_AI_MODEL
+      manualModel.value = DEFAULT_AI_MODEL
+    }
+    lastOkAt.value = ''
+    try { localStorage.removeItem('aios_ai_last_ok_at') } catch { /* ignore */ }
+    toastWarning(
+      hostChanged
+        ? '服务商已切换，请填写新地址对应的密钥后再刷新模型'
+        : '服务地址已变更，请重新刷新模型或测试连接',
+    )
+  }
 }
 
 function selectModel(name: string) {
@@ -221,7 +311,11 @@ function reset() {
 async function testAndSave() {
   onBlurBaseUrl()
   if (!store.effective.apiKey) {
-    toastWarning('请先填写 API 密钥')
+    toastWarning(
+      store.baseUrl.trim() && !inheritsEnvBase(store.baseUrl, store.envDefaults.baseUrl)
+        ? '当前服务需要单独密钥，请先填写'
+        : '请先填写 API 密钥',
+    )
     await focusKey()
     return
   }
@@ -232,7 +326,13 @@ async function testAndSave() {
     captureSnapshot()
     markOkNow()
     toastSuccess(store.lastMessage || '连接成功，设置已保存')
-  } catch {
+  } catch (err) {
+    const aborted =
+      err && typeof err === 'object' && (
+        (err as { name?: string }).name === 'AbortError' ||
+        /aborted|AbortError/i.test(err instanceof Error ? err.message : String(err))
+      )
+    if (aborted) return
     toastError(store.lastError || '连接失败')
   }
 }
@@ -240,19 +340,33 @@ async function testAndSave() {
 async function fetchModels() {
   onBlurBaseUrl()
   if (!store.effective.apiKey) {
-    toastWarning('请先填写 API 密钥')
+    toastWarning(
+      store.baseUrl.trim() && !inheritsEnvBase(store.baseUrl, store.envDefaults.baseUrl)
+        ? '当前服务需要单独密钥，请先填写该服务商密钥后再刷新模型'
+        : '请先填写 API 密钥',
+    )
     await focusKey()
     return
   }
+  const targetHost = originOfBaseUrl(store.effective.baseUrl) || store.effective.baseUrl
   try {
-    await store.fetchModels()
+    const models = await store.fetchModels()
+    if (!models.length && !store.lastMessage) {
+      // aborted / superseded by a newer request
+      if (store.listing) return
+      toastWarning('模型列表请求已取消，请再点一次刷新')
+      return
+    }
     if (store.model) manualModel.value = store.model
+    // Refresh list is a connectivity signal; persist so restart keeps models
     store.save()
     captureSnapshot()
     markOkNow()
-    toastSuccess(store.lastMessage || '已获取模型列表')
+    toastSuccess(store.lastMessage || ('已从 ' + targetHost + ' 获取模型列表'))
   } catch {
-    toastError(store.lastError || '获取模型失败')
+    lastOkAt.value = ''
+    try { localStorage.removeItem('aios_ai_last_ok_at') } catch { /* ignore */ }
+    toastError(store.lastError || ('获取模型失败：' + targetHost))
   }
 }
 
@@ -382,6 +496,9 @@ function copyText(text: string) {
         />
         <div class="current-model" :title="store.effective.model">
           当前 <strong>{{ store.effective.model || '未选择' }}</strong>
+          <span v-if="modelsSourceHost" class="models-source" :class="{ mismatch: !modelsMatchCurrent }">
+            · 列表来自 {{ modelsSourceHost }}
+          </span>
         </div>
       </div>
 
@@ -578,6 +695,8 @@ function copyText(text: string) {
   border: 1px dashed rgba(148, 163, 184, 0.22); color: var(--text-muted); font-size: 13px;
 }
 .empty-models p { margin: 0; }
+.models-source { margin-left: 0.35rem; opacity: 0.72; font-size: 0.85em; }
+.models-source.mismatch { color: #b45309; opacity: 1; }
 .manual-box { padding-top: 4px; }
 .manual-box label { margin-bottom: 8px; }
 .action-bar {

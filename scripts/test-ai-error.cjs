@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Unit tests for describeAiError (ISSUE-06)
  */
 const assert = require('assert')
@@ -51,6 +51,15 @@ check('empty', Object.assign(new Error('AI 返回了空内容，请稍后重试'
 })
 check('http', Object.assign(new Error('AI 请求失败 (500): boom'), { code: 'http' }), {
   code: 'http',
+  retryable: true,
+})
+
+check('model not found 503', Object.assign(new Error('AI 请求失败 (503): {"error":{"code":"model_not_found","message":"No available channel for model agnes-1.5-flash under group cachellm"}}'), { code: 'config' }), {
+  code: 'config',
+  retryable: true,
+})
+check('model not found text', new Error('No available channel for model agnes-1.5-flash under group x'), {
+  code: 'config',
   retryable: true,
 })
 check('cloudflare 524', Object.assign(new Error('AI 请求失败 (524): error code: 524'), { code: 'http' }), {

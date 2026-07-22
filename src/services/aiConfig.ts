@@ -4,7 +4,14 @@ import { aiFetch } from '@/services/aiFetch'
 
 export const AI_SETTINGS_STORAGE_KEY = 'aios_ai_settings'
 export const DEFAULT_AI_BASE_URL = 'https://apihub.agnes-ai.com/v1'
-export const DEFAULT_AI_MODEL = 'agnes-1.5-flash'
+/** Gateway currently exposes agnes-2.0-flash as the text chat model (1.5 retired). */
+export const DEFAULT_AI_MODEL = 'agnes-2.0-flash'
+
+/** Retired / renamed model ids → current default. Applied on resolve so old localStorage still works. */
+export const DEPRECATED_AI_MODELS: Record<string, string> = {
+  'agnes-1.5-flash': DEFAULT_AI_MODEL,
+  'agnes-1.5': DEFAULT_AI_MODEL,
+}
 
 export interface AiSettingsSnapshot {
   /** OpenAI-compatible base URL, e.g. https://api.example.com/v1 */
@@ -21,6 +28,8 @@ export interface AiSettingsStored {
   model?: string
   /** Cached model ids from last successful list call */
   availableModels?: string[]
+  /** Base URL that availableModels was fetched from */
+  modelsBaseUrl?: string
   updatedAt?: string
 }
 
@@ -48,6 +57,38 @@ export function normalizeBaseUrl(url: string): string {
   return url.trim().replace(/\/+$/, '')
 }
 
+/** Protocol+host for comparing gateways (path ignored). */
+export function originOfBaseUrl(url: string): string {
+  const base = normalizeBaseUrl(url || '')
+  if (!base) return ''
+  try {
+    return new URL(base).origin
+  } catch {
+    return base
+  }
+}
+
+/** Map retired model ids to a working default. */
+export function normalizeModelId(model: string): string {
+  const m = (model || '').trim()
+  if (!m) return DEFAULT_AI_MODEL
+  return DEPRECATED_AI_MODELS[m] || m
+}
+
+/**
+ * Prefer a text chat model from a gateway model list.
+ * Skips obvious image/video/audio-only ids when better options exist.
+ */
+export function pickPreferredChatModel(models: string[], preferred = DEFAULT_AI_MODEL): string {
+  const list = (models || []).map((m) => m.trim()).filter(Boolean)
+  if (!list.length) return preferred
+  if (list.includes(preferred)) return preferred
+  const nonMedia = list.filter(
+    (id) => !/(image|video|audio|tts|whisper|embedding|embed)/i.test(id),
+  )
+  return (nonMedia[0] || list[0] || preferred)
+}
+
 export function getEnvDefaults(): AiSettingsSnapshot {
   return {
     baseUrl: normalizeBaseUrl(envBaseUrl() || DEFAULT_AI_BASE_URL),
@@ -57,14 +98,31 @@ export function getEnvDefaults(): AiSettingsSnapshot {
 }
 
 /** Merge stored overrides over env defaults. Empty stored fields fall back to env. */
+/** True when form base is empty or equals env base (safe to inherit env API key). */
+export function inheritsEnvBase(storedBaseUrl: string | undefined | null, envBaseUrl: string): boolean {
+  const storedBase = normalizeBaseUrl(storedBaseUrl || '')
+  if (!storedBase) return true
+  return storedBase === normalizeBaseUrl(envBaseUrl || '')
+}
+
 export function resolveAiConfig(
   stored?: AiSettingsStored | null,
   envDefaults?: AiSettingsSnapshot,
 ): AiRuntimeConfig {
   const env = envDefaults ?? getEnvDefaults()
-  const baseUrl = normalizeBaseUrl(stored?.baseUrl || '') || env.baseUrl
-  const apiKey = (stored?.apiKey || '').trim() || env.apiKey
-  const model = (stored?.model || '').trim() || env.model
+  const storedBase = normalizeBaseUrl(stored?.baseUrl || '')
+  const baseUrl = storedBase || env.baseUrl
+  const storedKey = (stored?.apiKey || '').trim()
+  // Never silently reuse env key against a different gateway (e.g. Agnes key on 河涛素).
+  const inheritBase = inheritsEnvBase(storedBase, env.baseUrl)
+  const apiKey = storedKey || (inheritBase ? env.apiKey : '')
+  const rawModel = (stored?.model || '').trim()
+  // Only fall back to env/default model when still on the env gateway.
+  const model = rawModel
+    ? normalizeModelId(rawModel)
+    : inheritBase
+      ? normalizeModelId(env.model || DEFAULT_AI_MODEL)
+      : ''
   return { baseUrl, apiKey, model }
 }
 
@@ -125,29 +183,32 @@ export function maskApiKey(key: string): string {
   return k.slice(0, 4) + '****' + k.slice(-4)
 }
 
-function parseModelIds(data: unknown): string[] {
-  if (!data || typeof data !== 'object') return []
-  const root = data as Record<string, unknown>
-  const list = Array.isArray(root.data)
-    ? root.data
-    : Array.isArray(root.models)
-      ? root.models
-      : Array.isArray(root)
-        ? (root as unknown[])
-        : []
-
-  const ids: string[] = []
-  for (const item of list) {
-    if (typeof item === 'string' && item.trim()) {
-      ids.push(item.trim())
-      continue
-    }
-    if (item && typeof item === 'object') {
-      const rec = item as Record<string, unknown>
-      const id = rec.id ?? rec.name ?? rec.model
-      if (typeof id === 'string' && id.trim()) ids.push(id.trim())
-    }
+function collectModelIds(input: unknown, into: string[], depth = 0): void {
+  if (depth > 4 || input == null) return
+  if (typeof input === 'string') {
+    const id = input.trim()
+    if (id) into.push(id)
+    return
   }
+  if (Array.isArray(input)) {
+    for (const item of input) collectModelIds(item, into, depth + 1)
+    return
+  }
+  if (typeof input !== 'object') return
+  const rec = input as Record<string, unknown>
+  const direct = rec.id ?? rec.name ?? rec.model
+  if (typeof direct === 'string' && direct.trim()) {
+    into.push(direct.trim())
+  }
+  // Common OpenAI / NewAPI / nested gateway shapes
+  for (const key of ['data', 'models', 'list', 'items', 'result', 'rows']) {
+    if (key in rec) collectModelIds(rec[key], into, depth + 1)
+  }
+}
+
+function parseModelIds(data: unknown): string[] {
+  const ids: string[] = []
+  collectModelIds(data, ids)
   return Array.from(new Set(ids)).sort((a, b) => a.localeCompare(b))
 }
 
@@ -174,13 +235,29 @@ export async function listAiModels(opts?: {
 
   if (!response.ok) {
     const text = await response.text().catch(() => '')
-    throw new Error('获取模型列表失败 (' + response.status + ')' + (text ? ': ' + text.slice(0, 200) : ''))
+    let detail = text.slice(0, 220)
+    try {
+      const j = JSON.parse(text) as { message?: string; error?: { message?: string } | string; code?: string }
+      const msg =
+        (typeof j.message === 'string' && j.message) ||
+        (typeof j.error === 'string' && j.error) ||
+        (j.error && typeof j.error === 'object' && typeof j.error.message === 'string' ? j.error.message : '') ||
+        (typeof j.code === 'string' ? j.code : '')
+      if (msg) detail = msg
+    } catch { /* keep raw */ }
+    const host = originOfBaseUrl(baseUrl) || baseUrl
+    throw new Error('获取模型列表失败 [' + host + '] (' + response.status + ')' + (detail ? ': ' + detail : ''))
   }
 
-  const data = await response.json()
+  let data: unknown
+  try {
+    data = await response.json()
+  } catch {
+    throw new Error('模型列表响应不是 JSON，请检查地址是否为 OpenAI 兼容接口（需 /v1）')
+  }
   const models = parseModelIds(data)
   if (!models.length) {
-    throw new Error('接口未返回可用模型，请手动填写模型名称')
+    throw new Error('接口未返回可用模型，请手动填写模型名称（当前地址：' + (originOfBaseUrl(baseUrl) || baseUrl) + '）')
   }
   return models
 }
@@ -195,9 +272,11 @@ export async function testAiConnection(opts?: {
   const cfg = getAiConfig()
   const baseUrl = normalizeBaseUrl(opts?.baseUrl || cfg.baseUrl)
   const apiKey = (opts?.apiKey ?? cfg.apiKey).trim()
-  const model = (opts?.model || cfg.model || DEFAULT_AI_MODEL).trim()
+  const model = (opts?.model || cfg.model || '').trim()
   if (!baseUrl) throw new Error('请填写 API Base URL')
   if (!apiKey) throw new Error('请填写 API Key')
+  if (!model) throw new Error('请先选择或填写模型名称')
+  const modelId = normalizeModelId(model)
 
   try {
     const models = await listAiModels({ baseUrl, apiKey, signal: opts?.signal })
@@ -216,7 +295,7 @@ export async function testAiConnection(opts?: {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model,
+        model: modelId,
         messages: [{ role: 'user', content: 'ping' }],
         max_tokens: 4,
         temperature: 0,
@@ -237,3 +316,4 @@ export async function testAiConnection(opts?: {
     }
   }
 }
+

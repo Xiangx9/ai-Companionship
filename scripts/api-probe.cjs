@@ -10,7 +10,7 @@ const base = (env.VITE_API_BASE_URL || "https://apihub.agnes-ai.com/v1").replace
 const key = env.VITE_API_KEY || "";
 const url = new URL(base + "/chat/completions");
 const body = JSON.stringify({
-  model: "agnes-1.5-flash",
+  model: "agnes-2.0-flash",
   messages: [{ role: "user", content: "reply with only: pong" }],
   max_tokens: 32,
   temperature: 0,
@@ -46,3 +46,4 @@ req.on("error", (err) => {
 });
 req.write(body);
 req.end();
+

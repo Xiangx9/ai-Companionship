@@ -137,6 +137,8 @@ function isRetryableAiFailure(err: unknown): boolean {
   if (err instanceof AiJsonError) return true
   const code = err && typeof err === 'object' ? String((err as { code?: unknown }).code || '') : ''
   const msg = err instanceof Error ? err.message : String(err || '')
+  // Wrong / retired model will not recover by retrying the same id
+  if (/model_not_found|No available channel for model|模型不可用|无可用通道/i.test(msg)) return false
   if (code === 'timeout' || code === 'empty') return true
   // Cloudflare / gateway flakes: worth one or two automatic retries
   if (code === 'http' && /\b(524|504|502|503|429)\b/.test(msg)) return true

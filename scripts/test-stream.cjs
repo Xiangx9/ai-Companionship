@@ -31,6 +31,17 @@ function extractStreamDelta(data) {
   return asTextCandidate(message.content ?? first.text)
 }
 
+function extractStreamReasoningDelta(data) {
+  if (!data || typeof data !== 'object') return ''
+  const choices = Array.isArray(data.choices) ? data.choices : []
+  const first = choices[0] && typeof choices[0] === 'object' ? choices[0] : {}
+  const delta = first.delta && typeof first.delta === 'object' ? first.delta : {}
+  const fromDelta = asTextCandidate(delta.reasoning_content ?? delta.reasoning ?? delta.thinking)
+  if (fromDelta) return fromDelta
+  const message = first.message && typeof first.message === 'object' ? first.message : {}
+  return asTextCandidate(message.reasoning_content ?? message.reasoning)
+}
+
 function parseSseDataLine(line) {
   const raw = line.replace(/^data:\s?/, '').trim()
   if (!raw || raw === '[DONE]') return { done: true, chunk: '' }
@@ -110,9 +121,19 @@ async function main() {
   assert.strictEqual(extractStreamDelta({ choices: [{ delta: {} }] }), '')
   ok('empty delta')
 
+  assert.strictEqual(
+    extractStreamReasoningDelta({ choices: [{ delta: { reasoning_content: 'think' } }] }),
+    'think',
+  )
+  assert.strictEqual(
+    extractStreamDelta({ choices: [{ delta: { reasoning_content: 'think', content: '' } }] }),
+    '',
+  )
+  ok('reasoning delta separate from content')
+
   console.log('==== SUMMARY ====')
-  console.log(JSON.stringify({ passed, total: 6 }))
-  if (passed !== 6) process.exit(1)
+  console.log(JSON.stringify({ passed, total: 7 }))
+  if (passed !== 7) process.exit(1)
 }
 
 main().catch((err) => {

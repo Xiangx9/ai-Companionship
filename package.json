@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "test:progress": "node scripts/test-progress-state.cjs",
     "test:ai-error": "node scripts/test-ai-error.cjs",
-    "test:ai-config": "node scripts/test-ai-config.cjs",
+    "test:ai-config": "node scripts/test-ai-config.cjs && node scripts/test-ai-proxy-cache.cjs",
     "test:unit": "node scripts/test-progress-state.cjs && node scripts/test-ai-error.cjs && node scripts/test-with-retry.cjs && node scripts/test-study-plan-roll.cjs && node scripts/test-ai-config.cjs && node scripts/test-stream.cjs && node scripts/test-storage-slim.cjs && npm run test:today-card && npm run test:wrong-answers && npm run test:markdown",
     "test:smoke": "node scripts/smoke-e2e.cjs",
     "test:flow": "node scripts/real-user-flow.cjs",

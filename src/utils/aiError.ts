@@ -30,6 +30,12 @@ function readMessage(err: unknown): string {
   return ''
 }
 
+function isModelUnavailableMessage(raw: string): boolean {
+  return /model_not_found|No available channel for model|model is not available|unknown model|invalid model|模型不存在|模型不可用|无可用通道/i.test(
+    raw,
+  )
+}
+
 /**
  * Map raw AI / network errors into stable Chinese UI copy.
  */
@@ -46,7 +52,22 @@ export function describeAiError(err: unknown): AiErrorInfo {
     }
   }
 
-  if (code === 'timeout' || /超时|timeout/i.test(raw)) {
+  // Model retired / no channel — check before generic 503/timeout copy
+  if (isModelUnavailableMessage(raw) || (code === 'config' && /model/i.test(raw))) {
+    const m = raw.match(/No available channel for model\s+([^\s]+)(?:\s+under)?/i)
+    const modelName = m?.[1] ? m[1].replace(/["',]/g, '') : ''
+    return {
+      code: 'config',
+      title: '模型不可用',
+      message: modelName
+        ? `当前模型「${modelName}」在网关没有可用通道。请打开「设置」刷新模型列表，选择可用文本模型（如 agnes-2.0-flash）后重试。`
+        : '当前模型在网关没有可用通道。请打开「设置」刷新模型列表并切换可用文本模型后重试。',
+      retryable: true,
+    }
+  }
+
+  // Prefer explicit timeout codes; avoid swallowing gateway errors that merely mention "timeout"
+  if (code === 'timeout' || /请求超时|AI 请求超时|AI 响应较慢|upstream_timeout|A Timeout Occurred/i.test(raw)) {
     return {
       code: 'timeout',
       title: '请求超时',
@@ -55,7 +76,7 @@ export function describeAiError(err: unknown): AiErrorInfo {
     }
   }
 
-  if (code === 'config' || /VITE_API_KEY|API Key|未配置|设置/.test(raw)) {
+  if (code === 'config' || /VITE_API_KEY|API Key|未配置 API|请填写 API/i.test(raw)) {
     return {
       code: 'config',
       title: '配置缺失',
@@ -122,3 +143,4 @@ export function describeAiError(err: unknown): AiErrorInfo {
 export function isAbortLikeError(err: unknown): boolean {
   return describeAiError(err).code === 'aborted'
 }
+

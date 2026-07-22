@@ -1,6 +1,9 @@
 /**
  * Dev/preview reverse proxy for OpenAI-compatible AI gateways.
- * Frontend calls: /__ai_proxy/models with header X-AI-Proxy-Target: https://host/v1
+ * Frontend calls: /__ai_proxy/models?__ai_target=https%3A%2F%2Fhost%2Fv1
+ * with header X-AI-Proxy-Target: https://host/v1
+ *
+ * __ai_target is stripped before upstream so it only serves as a browser cache key.
  */
 import http from 'node:http'
 import https from 'node:https'
@@ -8,6 +11,7 @@ import { URL } from 'node:url'
 
 const PREFIX = '/__ai_proxy'
 const TARGET_HEADER = 'x-ai-proxy-target'
+const TARGET_QUERY = '__ai_target'
 
 function joinUrl(base, pathAndQuery) {
   const b = String(base || '').replace(/\/+$/, '')
@@ -27,12 +31,46 @@ function readBody(req) {
 function sendJson(res, status, obj) {
   res.statusCode = status
   res.setHeader('Content-Type', 'application/json; charset=utf-8')
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate')
+  res.setHeader('Pragma', 'no-cache')
   res.end(JSON.stringify(obj))
 }
 
+function resolveTargetBase(req) {
+  const header = req.headers[TARGET_HEADER]
+  if (typeof header === 'string' && header.trim()) return header.trim()
+
+  try {
+    const rawUrl = req.url || PREFIX
+    const u = new URL(rawUrl, 'http://localhost')
+    const q = u.searchParams.get(TARGET_QUERY)
+    if (q && q.trim()) return q.trim()
+  } catch {
+    /* ignore */
+  }
+  return ''
+}
+
+/** Path+query for upstream, without our cache-key query param. */
+function upstreamPathAndQuery(rawUrl) {
+  const pathAndQuery = rawUrl.startsWith(PREFIX) ? rawUrl.slice(PREFIX.length) || '/' : rawUrl
+  try {
+    const u = new URL(pathAndQuery, 'http://local.invalid')
+    u.searchParams.delete(TARGET_QUERY)
+    const q = u.searchParams.toString()
+    return u.pathname + (q ? '?' + q : '')
+  } catch {
+    return pathAndQuery
+  }
+}
+
 async function handleProxy(req, res) {
-  const targetBase = req.headers[TARGET_HEADER]
-  if (!targetBase || typeof targetBase !== 'string') {
+  // Never let the browser cache proxy responses across different upstream hosts.
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate')
+  res.setHeader('Pragma', 'no-cache')
+
+  const targetBase = resolveTargetBase(req)
+  if (!targetBase) {
     return sendJson(res, 400, {
       error: 'missing_proxy_target',
       message: '缺少 X-AI-Proxy-Target（API Base URL）',
@@ -42,7 +80,7 @@ async function handleProxy(req, res) {
   let targetUrl
   try {
     const rawUrl = req.url || PREFIX
-    const pathAndQuery = rawUrl.startsWith(PREFIX) ? rawUrl.slice(PREFIX.length) || '/' : rawUrl
+    const pathAndQuery = upstreamPathAndQuery(rawUrl)
     targetUrl = new URL(joinUrl(targetBase, pathAndQuery || '/'))
   } catch {
     return sendJson(res, 400, {
@@ -77,6 +115,9 @@ async function handleProxy(req, res) {
     if (typeof v === 'string') headers[key] = v
   }
   headers.host = targetUrl.host
+  // Avoid gzip/br bodies without Content-Encoding (breaks JSON.parse in browser)
+  headers['accept-encoding'] = 'identity'
+  headers['cache-control'] = 'no-cache'
   if (body && body.length) headers['content-length'] = String(body.length)
 
   const upstream = lib.request(
@@ -91,13 +132,20 @@ async function handleProxy(req, res) {
     },
     (upRes) => {
       res.statusCode = upRes.statusCode || 502
-      // Pass through useful headers; drop CORS/encoding that confuses browser piping
-      const pass = ['content-type', 'cache-control', 'x-request-id']
+      // Pass through useful headers; always force no-store on the client side.
+      const pass = ['content-type', 'x-request-id']
       for (const key of pass) {
         const v = upRes.headers[key]
         if (v) res.setHeader(key, v)
       }
-      // Avoid compressed pipe issues if node auto-handled; prefer identity
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate')
+      res.setHeader('Pragma', 'no-cache')
+      // Echo which upstream we hit (debug / UI verification)
+      try {
+        res.setHeader('X-AI-Proxy-Upstream', targetUrl.origin)
+      } catch {
+        /* ignore invalid header values */
+      }
       upRes.pipe(res)
     },
   )

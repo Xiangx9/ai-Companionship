@@ -24,6 +24,8 @@ knowledgeTree 可省略（客户端可重建）。
 ## 速度与体积
 - 字段尽量短；不要示例外的额外字段
 - 尽快完成输出，避免冗长叙述
+- 最终 JSON 必须写在 content 正文；不要只在思考/reasoning 里输出
+- 尽量缩短思考过程，优先给出完整 JSON
 
 ## 内容要求
 - 循序渐进，prerequisites 标注依赖 id

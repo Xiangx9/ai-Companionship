@@ -2,10 +2,16 @@
  * Browser-safe AI HTTP helper.
  * In Vite dev/preview, external OpenAI-compatible hosts are proxied via /__ai_proxy
  * to avoid CORS blocks (many gateways omit Access-Control-Allow-Origin).
+ *
+ * IMPORTANT: The proxy URL must differ per upstream host. Browsers (and some
+ * intermediates) cache GET by URL only and would otherwise reuse /models from
+ * another gateway when only the X-AI-Proxy-Target header changes.
  */
 
 export const AI_PROXY_PREFIX = '/__ai_proxy'
 export const AI_PROXY_TARGET_HEADER = 'X-AI-Proxy-Target'
+/** Query key used for cache-key uniqueness; stripped by the Vite proxy before upstream. */
+export const AI_PROXY_TARGET_QUERY = '__ai_target'
 
 function normalizeBaseUrl(url: string): string {
   return String(url || '').trim().replace(/\/+$/, '')
@@ -42,8 +48,10 @@ export function buildAiRequest(
   const path = apiPath.startsWith('/') ? apiPath : '/' + apiPath
 
   if (shouldUseAiProxy(base)) {
+    // Encode upstream base into the URL so GET /models is not shared across hosts in cache.
+    const qs = AI_PROXY_TARGET_QUERY + '=' + encodeURIComponent(base)
     return {
-      url: AI_PROXY_PREFIX + path,
+      url: AI_PROXY_PREFIX + path + (path.includes('?') ? '&' : '?') + qs,
       proxyTarget: base,
     }
   }
@@ -55,11 +63,18 @@ export async function aiFetch(
   apiPath: string,
   init: RequestInit & { baseUrl: string },
 ): Promise<Response> {
-  const { baseUrl, ...rest } = init
+  const { baseUrl, cache, ...rest } = init
   const { url, proxyTarget } = buildAiRequest(apiPath, { baseUrl })
   const headers = new Headers(rest.headers || {})
   if (proxyTarget) {
     headers.set(AI_PROXY_TARGET_HEADER, proxyTarget)
   }
-  return fetch(url, { ...rest, headers })
+  // Never reuse a previous gateway's JSON body for the same path.
+  if (!headers.has('Cache-Control')) headers.set('Cache-Control', 'no-cache')
+  if (!headers.has('Pragma')) headers.set('Pragma', 'no-cache')
+  return fetch(url, {
+    ...rest,
+    headers,
+    cache: cache ?? 'no-store',
+  })
 }

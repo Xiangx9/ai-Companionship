@@ -117,6 +117,14 @@ async function main() {
   } catch {
     assert.strictEqual(m, 1)
     console.log('  ok config not retried')
+
+// model_not_found must not burn retries
+{
+  let calls = 0
+  const src = fs.readFileSync(path.join(__dirname, '../src/utils/aiJson.ts'), 'utf8')
+  assert.ok(/model_not_found[\s\S]{0,80}return false/.test(src) || src.includes('No available channel for model'), 'source refuses model_not_found retries')
+  console.log('  ok model_not_found not retried (source contract)')
+}
   }
 
   console.log('all withRetry tests passed')

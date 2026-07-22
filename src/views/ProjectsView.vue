@@ -5,12 +5,15 @@ import { useLearningStore } from '@/store/learning'
 import { downloadTextFile, readTextFile } from '@/utils/storage'
 import { toastError, toastSuccess, toastWarning } from '@/utils/toast'
 import type { LearningProject } from '@/types/learning'
+import ConfirmDialog from '@/components/ConfirmDialog.vue'
 
 const router = useRouter()
 const store = useLearningStore()
 const projects = computed(() => store.projects)
 const fileInput = ref<HTMLInputElement | null>(null)
 const importing = ref(false)
+const pendingDelete = ref<LearningProject | null>(null)
+const deleting = ref(false)
 
 function goToProject(id: string) {
   store.setActiveProject(id)
@@ -21,12 +24,43 @@ function goToProject(id: string) {
   })
 }
 
-function deleteProject(id: string) {
-  if (confirm('确定要删除这个项目吗？')) {
-    store.deleteProject(id)
-    toastSuccess('项目已删除')
+function askDeleteProject(proj: LearningProject) {
+  pendingDelete.value = proj
+}
+
+function cancelDelete() {
+  if (deleting.value) return
+  pendingDelete.value = null
+}
+
+function confirmDelete() {
+  const proj = pendingDelete.value
+  if (!proj || deleting.value) return
+  deleting.value = true
+  try {
+    store.deleteProject(proj.id)
+    toastSuccess('已删除「' + proj.name + '」')
+    pendingDelete.value = null
+  } catch (err) {
+    toastError(err instanceof Error ? err.message : '删除失败')
+  } finally {
+    deleting.value = false
   }
 }
+
+const deleteDetails = computed(() => {
+  const proj = pendingDelete.value
+  if (!proj) return [] as string[]
+  const total = totalKpCount(proj)
+  const done = completedCount(proj)
+  const mods = moduleCount(proj)
+  const pct = progressPercent(proj)
+  return [
+    `学习进度 ${pct}%（${done}/${total || 0} 知识点）`,
+    mods ? `${mods} 个模块 · 本地路径与笔记` : '本地路径、进度与笔记',
+    '删除后无法恢复（可先「导出备份」）',
+  ]
+})
 
 function exportAll() {
   const data = store.exportBackup()
@@ -150,10 +184,26 @@ function levelTone(level?: string) {
         @click="goToProject(proj.id)"
       >
         <div class="card-top">
-          <div class="project-icon">📖</div>
+          <div class="project-icon">🗺️</div>
           <div class="top-right">
             <span class="level-pill" :class="levelTone(proj.path?.level)">{{ levelLabel(proj.path?.level) }}</span>
-            <button class="delete-btn" type="button" title="删除项目" @click.stop="deleteProject(proj.id)">删除</button>
+            <button
+              class="delete-btn"
+              type="button"
+              title="删除项目"
+              aria-label="删除项目"
+              @click.stop="askDeleteProject(proj)"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path
+                  d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2m-8 0 1 12a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1l1-12M10 11v6M14 11v6"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </button>
           </div>
         </div>
 
@@ -190,6 +240,20 @@ function levelTone(level?: string) {
         </div>
       </article>
     </div>
+
+    <ConfirmDialog
+      :open="Boolean(pendingDelete)"
+      tone="danger"
+      title="删除这个学习项目？"
+      :subject="pendingDelete?.name || ''"
+      description="将从本机移除该项目的全部学习数据，此操作不可撤销。"
+      :details="deleteDetails"
+      cancel-label="保留项目"
+      confirm-label="确认删除"
+      :busy="deleting"
+      @cancel="cancelDelete"
+      @confirm="confirmDelete"
+    />
   </div>
 </template>
 
@@ -313,12 +377,15 @@ function levelTone(level?: string) {
 }
 
 .delete-btn {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
   border: 1px solid transparent;
   background: transparent;
   color: var(--text-muted);
-  border-radius: 8px;
-  padding: 6px 10px;
-  font-size: 12px;
+  border-radius: 10px;
+  padding: 0;
   cursor: pointer;
   opacity: 0;
   transition: 0.18s ease;
@@ -329,7 +396,8 @@ function levelTone(level?: string) {
   opacity: 1;
 }
 
-.delete-btn:hover {
+.delete-btn:hover,
+.delete-btn:focus-visible {
   color: #ff8b97;
   border-color: rgba(255,93,108,0.3);
   background: rgba(255,93,108,0.08);
