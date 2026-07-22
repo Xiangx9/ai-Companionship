@@ -1,4 +1,4 @@
-# Logs
+﻿# Logs
 logs
 *.log
 npm-debug.log*
@@ -24,3 +24,17 @@ dist-ssr
 *.sw?
 .env.local
 .playwright-mcp
+
+# Local probe / smoke artifacts
+screenshots/*.err
+screenshots/*.out
+screenshots/*.pid
+screenshots/*-report.json
+screenshots/*-probe*.json
+screenshots/api-*.json
+screenshots/ProjectsView.orig.vue
+screenshots/flow/
+screenshots/smoke/
+scripts/_*
+scripts/*probe*.cjs
+!scripts/api-probe.cjs
